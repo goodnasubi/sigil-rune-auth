@@ -78,9 +78,30 @@ rune_cli <register|disable|bump-generation|set-password> --dir=<DB ディレク�
 - `logout_session` は `DELETE` 成功で失効を確定します。KV エラー時はハッシュキーを保留に入れ、`Unavailable`（HTTP 503 相当）を返します。呼び出し側は `retry_pending_logouts` を定期的に呼び、KV が停止した場合は開き直してから同じ保留リストで再試行します。再試行は 1 回の呼び出しにつき各キーに 1 回です。プロセスを再起動すると保留リストは失われます。
 - `session_cookie` は小文字 hex の ID と `Secure; HttpOnly; SameSite=Lax; Path=/` を持つ `__Host-sigil_session` の発行用ヘッダー値を `Secret` で返します。ログアウトでは結果にかかわらず `clear_session_cookie` の値を使います。HTTP 応答への組み込みと Cookie ヘッダーの読み取りは段 4 で行います。
 
+## 段 4: HTTP サービス
+
+[ADR 0060][adr0060] 決定 4 の段 4 です。`sigil/rune_http.sigil` は 4 つのエンドポイントと CSRF 検査、一様な失敗応答、Cookie 管理、抑制を提供します。
+
+| エンドポイント | メソッド | 内容 |
+| --- | --- | --- |
+| `/auth/login` | `POST` | `{username, password}`。成功で新しいセッションを作り `__Host-sigil_session` cookie を返します。失敗は一様な 401。制限超過は 429。 |
+| `/auth/logout` | `POST` | セッションを失効し、cookie の削除（`Max-Age=0`）を指示します。成否不明は 503。 |
+| `/auth/session` | `GET` | 有効なセッションなら `{"sub":"u..."}`。無ければ 401。転送された cookie を持つアプリの確認にも使えます。 |
+| `/auth/token` | `POST` | `{audience}`。セッションが有効で audience が登録済みなら、アクセストークンと期限を返します。それ以外は 401 または 403。 |
+
+決めたこと:
+
+- **CSRF 検査**: 状態を変える要求（`POST /auth/login`・`POST /auth/logout`・`POST /auth/token`）は `Content-Type: application/json` かつ `Origin` が設定した公開オリジンと完全一致のときだけ受け付けます。`Origin` が無い要求や一致しない要求は 403、不正な Content-Type は 400 で拒否します。`GET /auth/session` は状態を変えないため Origin 検査を免除します。
+- **固定の失敗応答と一様性**: すべての応答は JSON で、理由別の本文は作りません（400 は `{"error":"bad_request"}`、401 は `{"error":"unauthorized"}`、403 は `{"error":"forbidden"}`、429 は `{"error":"too_many_requests"}`、503 は `{"error":"service_unavailable"}`）。利用者の有無・パスワードの誤り・無効な利用者によらず一様な 401 を返します。
+- **Cookie と固定化防止**: ログイン成功ごとに新しい乱数からセッション ID を発行します。クライアントが提示したセッション ID は再利用せず、固定化攻撃を防ぎます。
+- **秘密の非漏洩**: キー・パスワード・セッション ID・トークン・`Authorization`・`Cookie` をログ・エラー・応答に出しません。ログに出せるのは利用者 ID と固定の分類だけです。
+- **要求のファジングと上限**: 本文長上限（既定 4096 バイト）、フィールド長上限（`username` 1〜64 バイト、`password` 12〜256 バイト、`audience` 1〜128 バイト）、厳格な JSON（キー重複・未知キー・型不一致の拒否）、同時 PBKDF2 数上限（超過は 429）。
+- **sigix 背後での結合**: 信頼するプロキシ（`trusted_proxies`）からの要求では `X-Forwarded-For` のクライアント IP を使用し、接続元ごとの抑制（15 分に 5 回失敗で 15 分拒否）を行います。信頼できない接続元からの `X-Forwarded-For` は無視します。
+- **ADR 0037 との往復**: 発行したアクセストークンは、アプリ側で `web.verify_bearer` により検証可能であり、同一の主体（`sub`）が得られます。
+
 ## 検証
 
-Linux x86-64 で Git、Rustup、C リンカーを用意し、`scripts/check.sh` を実行します。Sigil のコンパイラ・埋め込み標準ライブラリ・ネイティブ核は同一のコミット `15beabc44aff08a0566abe3405d722e35b9b8aa5`、sigil-db 核は `9483e36f08c35bfc62b3beeb008a531887506037` を使用します（どちらも取得後にコミットと変更なしを確認します）。Rust は 1.100.0、依存クレートは同コミットの `Cargo.lock` で固定します。KV は段 2 の `7dfcf15b24251d80904f8d54e54b735652b89303` に固定します。スクリプトは Cargo の fmt と Clippy を実行し、固定した処理系の `sigil test --ct` で `Sigil.toml` に登録した導出鍵の照合関数を静的検査と CLIF 検査にかけます。同じ処理系の評価器とネイティブ出力で段 1〜3 の試験も実行します。段 3 の試験は永続 KV の期限境界、WAL 障害後の再試行と失効、世代変更と無効化を検査します。TCP 経由の試験は後続対応です。段 2 の試験は、抑制の境界（`stage_two_throttle_test`）、利用者表・ログイン・移行（`stage_two_users_test`）、中断・復旧（`stage_two_recovery_test`）、CLI（`stage_two_cli_test`）です。中断・復旧は、4 つの更新の全 I/O の関門を 3 通り（I/O 失敗・クラッシュ・書き込みの途中切れ）で中断し、再起動後の行が「完全に入った」か「まったく入っていない」かのどちらかであることと、一意索引と表が食い違わないことを確かめます。最後に、実行ファイルの引数・終了コード・出力を煙試験で確かめます。試験は PBKDF2 の反復回数を規則の下限 4096 にして時間を抑えています（煙試験の `register` 1 回だけ実運用の 100,000 回です）。
+Linux x86-64 で Git、Rustup、C リンカーを用意し、`scripts/check.sh` を実行します。Sigil のコンパイラ・埋め込み標準ライブラリ・ネイティブ核は同一のコミット `15beabc44aff08a0566abe3405d722e35b9b8aa5`、sigil-db 核は `9483e36f08c35bfc62b3beeb008a531887506037` を使用します（どちらも取得後にコミットと変更なしを確認します）。Rust は 1.100.0、依存クレートは同コミットの `Cargo.lock` で固定します。KV は段 2 の `7dfcf15b24251d80904f8d54e54b735652b89303` に固定します。スクリプトは Cargo の fmt と Clippy を実行し、固定した処理系の `sigil test --ct` で `Sigil.toml` に登録した導出鍵の照合関数を静的検査と CLIF 検査にかけます。同じ処理系の評価器とネイティブ出力で段 1〜4 の試験も実行します。段 4 の試験は 4 つのエンドポイント、cookie の発行・受け取りと固定化防止、Origin・Content-Type の CSRF 検査、一様な 401 応答、秘密の非漏洩、要求のファジングと上限境界、同時 PBKDF2 上限と IP 抑制、sigix の背後での結合（`X-Forwarded-For`）、ADR 0037 の検証器との往復を検査します。段 3 の試験は永続 KV の期限境界、WAL 障害後の再試行と失効、世代変更と無効化を検査します。TCP 経由の試験は後続対応です。段 2 の試験は、抑制の境界（`stage_two_throttle_test`）、利用者表・ログイン・移行（`stage_two_users_test`）、中断・復旧（`stage_two_recovery_test`）、CLI（`stage_two_cli_test`）です。中断・復旧は、4 つの更新の全 I/O の関門を 3 通り（I/O 失敗・クラッシュ・書き込みの途中切れ）で中断し、再起動後の行が「完全に入った」か「まったく入っていない」かのどちらかであることと、一意索引と表が食い違わないことを確かめます。最後に、実行ファイルの引数・終了コード・出力を煙試験で確かめます。試験は PBKDF2 の反復回数を規則の下限 4096 にして時間を抑えています（煙試験の `register` 1 回だけ実運用の 100,000 回です）。
 
 試験の固定値は Python 標準ライブラリの `hashlib.pbkdf2_hmac`、`hashlib.sha256`、`struct.pack`、`base64.urlsafe_b64encode`、`hmac.digest` で独立に算出しました。
 

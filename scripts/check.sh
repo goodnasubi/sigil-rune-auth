@@ -87,6 +87,7 @@ run_entry stage_two_recovery_test "Stage 2 interruption and recovery"
 run_entry stage_two_cli_test "Stage 2 CLI commands"
 run_entry stage_three_sessions_test "Stage 3 persistent sessions"
 run_entry stage_three_tcp_sessions_test "Stage 3 TCP persistent sessions"
+run_entry stage_four_http_test "Stage 4 HTTP service"
 
 # Smoke test of the real command line: argument reading, exit codes and the output of the native executable.
 # The one `register` below uses the full 100,000 iterations of the production setting.
@@ -121,4 +122,4 @@ expect_exit 0 "$cli" disable "--dir=$dir" --user=alice
 expect_exit 3 "$cli" disable "--dir=$dir" --user=ghost
 expect_exit 2 "$cli" bogus "--dir=$dir" --user=alice
 printf 'CLI smoke test passed.\n'
-printf 'Stage 1 through stage 3 evaluator and native tests passed.\n'
+printf 'Stage 1 through stage 4 evaluator and native tests passed.\n'

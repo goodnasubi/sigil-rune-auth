@@ -1,0 +1,578 @@
+module stage_four_http_test
+  targets server
+  trust none
+
+use rune_auth.user_subject;
+use rune_http.AuthEvent;
+use rune_http.extract_client_ip;
+use rune_http.handle_auth_request;
+use rune_http.log_event_text;
+use rune_http.new_audience_config;
+use rune_http.new_http_config;
+use rune_http.new_http_service;
+use rune_http.parse_raw_request;
+use rune_login.new_login_gate;
+use rune_sessions.new_pending_logouts;
+use rune_throttle.new_throttle;
+use rune_users.bump_generation;
+use rune_users.disable_user;
+use rune_users.insert_user;
+use stage_two_support.bytes;
+use stage_two_support.fixed_record;
+use stage_two_support.fresh;
+use stage_two_support.low_iterations;
+use stage_two_support.remove_tree;
+use stash.persistent.close_persistent;
+use stash.persistent.open_persistent;
+
+// ADR 0060 段 4 の結合試験:
+// - 4 つのエンドポイントの動作
+// - cookie の発行と受け取り、ログインごとの新セッション ID、固定化防止
+// - Origin・Content-Type の CSRF 検査と固定の失敗応答
+// - 失敗応答の一様性（未知の利用者・誤パスワード・無効利用者）
+// - 秘密がログ・エラー・応答に出ないことの検査
+// - 要求のファジングと上限境界（ボディ長、厳格な JSON、パスワード長）
+// - sigix 背後での結合試験（X-Forwarded-For）
+// - ADR 0037 の検証器（web.verify_bearer）を使うアプリへの往復
+
+fn string_contains(haystack: &String, needle: &String) -> Bool
+  intent "文字列 haystack に needle が含まれるか"
+  requires none
+  ensures none
+  effects none
+{
+  let h_bytes = haystack.as_bytes();
+  let n_bytes = needle.as_bytes();
+  let h_len = h_bytes.byte_len();
+  let n_len = n_bytes.byte_len();
+  if n_len > h_len {
+    return false;
+  }
+  let mut i = 0;
+  while i <= h_len - n_len {
+    let mut matched = true;
+    let mut j = 0;
+    while j < n_len && matched {
+      if h_bytes.get(i + j).unwrap_or(0) != n_bytes.get(j).unwrap_or(0) {
+        matched = false;
+      } else {
+        j = j + 1;
+      }
+    }
+    if matched {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn concat3(a: &String, b: &String, c: &String) -> String
+  intent "3 つの文字列を連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.new();
+  bytes.extend(&a.as_bytes());
+  bytes.extend(&b.as_bytes());
+  bytes.extend(&c.as_bytes());
+  return bytes.to_string_utf8().unwrap_or("");
+}
+
+fn header_value(resp: &HttpResponse, name: &String) -> Option<String>
+  intent "指定した見出しの値を文字列で返す"
+  requires none
+  ensures none
+  effects none
+{
+  let target = name.as_bytes();
+  let headers = resp.headers();
+  let mut i = 0;
+  while i < headers.len() {
+    match headers.get(i) {
+      Some(h) => {
+        if h.name().as_bytes() == target {
+          return h.value().to_string_utf8().ok();
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn extract_cookie_from_set_cookie(set_cookie_val: &String) -> Option<String>
+  intent "Set-Cookie 見出しから __Host-sigil_session=<hex> の Cookie 送信用文字列を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let b = set_cookie_val.as_bytes();
+  let target = "__Host-sigil_session=".as_bytes();
+  let t_len = target.byte_len();
+  let len = b.byte_len();
+  let mut i = 0;
+  while i + t_len <= len {
+    let mut matched = true;
+    let mut j = 0;
+    while j < t_len && matched {
+      if b.get(i + j).unwrap_or(0) != target.get(j).unwrap_or(0) {
+        matched = false;
+      } else {
+        j = j + 1;
+      }
+    }
+    if matched {
+      let mut end = i + t_len;
+      while end < len && b.get(end).unwrap_or(0) != 59 {
+        end = end + 1;
+      }
+      return match b.slice(i, end) {
+        Ok(cookie_pair) => match cookie_pair.to_string_utf8() {
+          Ok(s) => Some(s),
+          Err(_) => None,
+        },
+        Err(_) => None,
+      };
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn extract_json_token(body_str: &String) -> Option<String>
+  intent "{\"token\":\"...\"} の token の中身を抽出する"
+  requires none
+  ensures none
+  effects none
+{
+  let b = body_str.as_bytes();
+  let target = "\"token\":\"".as_bytes();
+  let t_len = target.byte_len();
+  let len = b.byte_len();
+  let mut i = 0;
+  while i + t_len <= len {
+    let mut matched = true;
+    let mut j = 0;
+    while j < t_len && matched {
+      if b.get(i + j).unwrap_or(0) != target.get(j).unwrap_or(0) {
+        matched = false;
+      } else {
+        j = j + 1;
+      }
+    }
+    if matched {
+      let start = i + t_len;
+      let mut end = start;
+      while end < len && b.get(end).unwrap_or(0) != 34 {
+        end = end + 1;
+      }
+      return match b.slice(start, end) {
+        Ok(tok) => match tok.to_string_utf8() {
+          Ok(s) => Some(s),
+          Err(_) => None,
+        },
+        Err(_) => None,
+      };
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
+  intent "ADR 0060 段 4 の HTTP サービスを網羅的に試験する"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  let mut users = match fresh(&users_dir, low_iterations()) {
+    Ok(u) => Ok(u),
+    Err(_) => Err(1),
+  }?;
+  let db_id = bytes(16, 8);
+  let mut kv = match open_persistent(kv_dir.clone(), db_id, true) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(2),
+  }?;
+  let mut pending = new_pending_logouts();
+
+  // 1. 利用者の準備（Alice: 有効、Bob: 無効化）
+  let alice_pass = "correct horse battery";
+  let alice_record = fixed_record(&alice_pass, 1, low_iterations());
+  let alice_user_id = match insert_user(&mut users, &"alice".as_bytes(), &alice_record, 1000) {
+    Ok(uid) => Ok(uid),
+    Err(_) => Err(3),
+  }?;
+  let alice_sub = match user_subject(&alice_user_id) {
+    Some(s) => match s.to_string_utf8() {
+      Ok(text) => Ok(text),
+      Err(_) => Err(4),
+    },
+    None => Err(4),
+  }?;
+
+  let bob_pass = "another secret password";
+  let bob_record = fixed_record(&bob_pass, 2, low_iterations());
+  let _ = insert_user(&mut users, &"bob".as_bytes(), &bob_record, 1000);
+  let _ = disable_user(&mut users, &"bob".as_bytes());
+
+  // 2. サービス設定の作成
+  let aud_key = Secret.from_bytes(bytes(32, 9));
+  let mut audiences = List.new();
+  audiences.push(new_audience_config("sigil.api", Secret.from_bytes(aud_key.expose())));
+
+  let mut trusted_proxies = List.new();
+  trusted_proxies.push("127.0.0.1");
+  trusted_proxies.push("::1");
+
+  let config = new_http_config("https://auth.example.com", 28800, 300, 4096, 4, trusted_proxies, audiences);
+  let mut service = new_http_service(config);
+  let mut gate = match new_login_gate(&users, new_throttle()) {
+    Ok(g) => Ok(g),
+    Err(_) => Err(5),
+  }?;
+
+  let now_fn = move || Some(2000);
+  let remote_proxy = "127.0.0.1";
+
+  // 3. 正常系フロー: ログイン
+  let login_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 55\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\"}";
+  let login_req = match parse_raw_request(&login_wire) {
+    Some(r) => Ok(r),
+    None => Err(6),
+  }?;
+  let login_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req, &remote_proxy, now_fn);
+  if login_resp.status() != 200 {
+    return Err(7);
+  }
+  let cookie_hdr = match header_value(&login_resp, &"set-cookie") {
+    Some(h) => Ok(h),
+    None => Err(8),
+  }?;
+  let session_cookie_pair = match extract_cookie_from_set_cookie(&cookie_hdr) {
+    Some(c) => Ok(c),
+    None => Err(9),
+  }?;
+
+  // 4. 2回目のログインで異なるセッション ID が返ること（ログインごとの新 ID & 固定化防止）
+  let login_req2 = match parse_raw_request(&login_wire) {
+    Some(r) => Ok(r),
+    None => Err(10),
+  }?;
+  let login_resp2 = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req2, &remote_proxy, now_fn);
+  let cookie_hdr2 = match header_value(&login_resp2, &"set-cookie") {
+    Some(h) => Ok(h),
+    None => Err(11),
+  }?;
+  if cookie_hdr == cookie_hdr2 {
+    return Err(12);  // 同じセッション ID は禁止
+  }
+
+  // クライアントが既存 Cookie を提示してログインしても固定化されず新しい ID になること
+  let fix_wire = concat3(&"POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nCookie: ", &session_cookie_pair, &"\r\nContent-Length: 55\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\"}");
+  let fix_req = match parse_raw_request(&fix_wire) {
+    Some(r) => Ok(r),
+    None => Err(13),
+  }?;
+  let fix_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &fix_req, &remote_proxy, now_fn);
+  let fix_cookie_hdr = match header_value(&fix_resp, &"set-cookie") {
+    Some(h) => Ok(h),
+    None => Err(14),
+  }?;
+  if string_contains(&fix_cookie_hdr, &session_cookie_pair) {
+    return Err(15);  // 提示されたセッション ID の再利用は禁止
+  }
+
+  // 5. GET /auth/session の検証
+  let sess_wire = concat3(&"GET /auth/session HTTP/1.1\r\nHost: auth.example.com\r\nCookie: ", &session_cookie_pair, &"\r\n\r\n");
+  let sess_req = match parse_raw_request(&sess_wire) {
+    Some(r) => Ok(r),
+    None => Err(16),
+  }?;
+  let sess_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &sess_req, &remote_proxy, now_fn);
+  if sess_resp.status() != 200 {
+    return Err(17);
+  }
+  let expected_sess_body = concat3(&"{\"sub\":\"", &alice_sub, &"\"}");
+  let sess_body = match sess_resp.body().to_string_utf8() {
+    Ok(s) => Ok(s),
+    Err(_) => Err(18),
+  }?;
+  if sess_body != expected_sess_body {
+    return Err(19);
+  }
+
+  // 6. POST /auth/token の検証 & ADR 0037 の検証器との往復
+  let tok_wire = concat3(&"POST /auth/token HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nCookie: ", &session_cookie_pair, &"\r\nContent-Length: 24\r\n\r\n{\"audience\":\"sigil.api\"}");
+  let tok_req = match parse_raw_request(&tok_wire) {
+    Some(r) => Ok(r),
+    None => Err(20),
+  }?;
+  let tok_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &tok_req, &remote_proxy, now_fn);
+  if tok_resp.status() != 200 {
+    return Err(21);
+  }
+  let tok_body = match tok_resp.body().to_string_utf8() {
+    Ok(s) => Ok(s),
+    Err(_) => Err(22),
+  }?;
+  let token_str = match extract_json_token(&tok_body) {
+    Some(t) => Ok(t),
+    None => Err(23),
+  }?;
+
+  // ADR 0037 の web.verify_bearer でトークンを検証
+  let verify_aud = "sigil.api";
+  match web.verify_bearer(&aud_key, &verify_aud, &token_str.as_bytes(), 2000) {
+    Err(_) => {
+      return Err(24);
+    }
+    Ok(identity) => {
+      if identity.subject() != alice_sub {
+        return Err(25);
+      }
+    }
+  }
+
+  // 7. 未登録 audience への要求（403 Forbidden）
+  let bad_aud_wire = concat3(&"POST /auth/token HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nCookie: ", &session_cookie_pair, &"\r\nContent-Length: 26\r\n\r\n{\"audience\":\"unknown.app\"}");
+  let bad_aud_req = match parse_raw_request(&bad_aud_wire) {
+    Some(r) => Ok(r),
+    None => Err(26),
+  }?;
+  let bad_aud_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_aud_req, &remote_proxy, now_fn);
+  if bad_aud_resp.status() != 403 {
+    return Err(27);
+  }
+
+  // 8. 世代更新による全セッション失効
+  let _ = bump_generation(&mut users, &"alice".as_bytes());
+  let expired_sess_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &sess_req, &remote_proxy, now_fn);
+  if expired_sess_resp.status() != 401 {
+    return Err(28);
+  }
+  let expired_tok_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &tok_req, &remote_proxy, now_fn);
+  if expired_tok_resp.status() != 401 {
+    return Err(29);
+  }
+
+  // 9. Alice で再ログインして新しいセッションを取得し、ログアウトを検証
+  let login_resp3 = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req, &remote_proxy, now_fn);
+  let cookie_hdr3 = match header_value(&login_resp3, &"set-cookie") {
+    Some(h) => Ok(h),
+    None => Err(30),
+  }?;
+  let session_cookie_pair3 = match extract_cookie_from_set_cookie(&cookie_hdr3) {
+    Some(c) => Ok(c),
+    None => Err(31),
+  }?;
+
+  let logout_wire = concat3(&"POST /auth/logout HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nCookie: ", &session_cookie_pair3, &"\r\nContent-Length: 2\r\n\r\n{}");
+  let logout_req = match parse_raw_request(&logout_wire) {
+    Some(r) => Ok(r),
+    None => Err(32),
+  }?;
+  let logout_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &logout_req, &remote_proxy, now_fn);
+  if logout_resp.status() != 200 {
+    return Err(33);
+  }
+  let logout_set_cookie = match header_value(&logout_resp, &"set-cookie") {
+    Some(h) => Ok(h),
+    None => Err(34),
+  }?;
+  if !string_contains(&logout_set_cookie, &"Max-Age=0") {
+    return Err(35);
+  }
+
+  // ログアウト後の確認
+  let sess_wire3 = concat3(&"GET /auth/session HTTP/1.1\r\nHost: auth.example.com\r\nCookie: ", &session_cookie_pair3, &"\r\n\r\n");
+  let sess_req3 = match parse_raw_request(&sess_wire3) {
+    Some(r) => Ok(r),
+    None => Err(36),
+  }?;
+  let post_logout_sess = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &sess_req3, &remote_proxy, now_fn);
+  if post_logout_sess.status() != 401 {
+    return Err(37);
+  }
+
+  // 10. Origin・Content-Type 検査（CSRF 対策）
+  // Origin なし
+  let no_orig_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 55\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\"}";
+  let no_orig_req = match parse_raw_request(&no_orig_wire) {
+    Some(r) => Ok(r),
+    None => Err(38),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &no_orig_req, &remote_proxy, now_fn).status() != 403 {
+    return Err(39);
+  }
+
+  // 偽の Origin
+  let fake_orig_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://attacker.com\r\nContent-Type: application/json\r\nContent-Length: 55\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\"}";
+  let fake_orig_req = match parse_raw_request(&fake_orig_wire) {
+    Some(r) => Ok(r),
+    None => Err(40),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &fake_orig_req, &remote_proxy, now_fn).status() != 403 {
+    return Err(41);
+  }
+
+  // Content-Type なし
+  let no_ct_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Length: 55\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\"}";
+  let no_ct_req = match parse_raw_request(&no_ct_wire) {
+    Some(r) => Ok(r),
+    None => Err(42),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &no_ct_req, &remote_proxy, now_fn).status() != 400 {
+    return Err(43);
+  }
+
+  // 不正な Content-Type
+  let bad_ct_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: text/plain\r\nContent-Length: 55\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\"}";
+  let bad_ct_req = match parse_raw_request(&bad_ct_wire) {
+    Some(r) => Ok(r),
+    None => Err(44),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_ct_req, &remote_proxy, now_fn).status() != 400 {
+    return Err(45);
+  }
+
+  // 11. 失敗応答の一様性（未知の利用者・誤パスワード・無効利用者）
+  let ghost_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 55\r\n\r\n{\"username\":\"ghost\",\"password\":\"correct horse battery\"}";
+  let ghost_req = match parse_raw_request(&ghost_wire) {
+    Some(r) => Ok(r),
+    None => Err(46),
+  }?;
+  let ghost_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &ghost_req, &remote_proxy, now_fn);
+
+  let wrong_pass_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 52\r\n\r\n{\"username\":\"alice\",\"password\":\"wrong password 123\"}";
+  let wrong_pass_req = match parse_raw_request(&wrong_pass_wire) {
+    Some(r) => Ok(r),
+    None => Err(47),
+  }?;
+  let wrong_pass_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &wrong_pass_req, &remote_proxy, now_fn);
+
+  let disabled_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 57\r\n\r\n{\"username\":\"bob..\",\"password\":\"another secret password\"}";
+  let disabled_req = match parse_raw_request(&disabled_wire) {
+    Some(r) => Ok(r),
+    None => Err(48),
+  }?;
+  let disabled_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &disabled_req, &remote_proxy, now_fn);
+
+  if ghost_resp.status() != 401 || wrong_pass_resp.status() != 401 || disabled_resp.status() != 401 {
+    return Err(49);
+  }
+  let unauth_body = "{\"error\":\"unauthorized\"}";
+  let g_b = match ghost_resp.body().to_string_utf8() {
+    Ok(s) => Ok(s),
+    Err(_) => Err(50),
+  }?;
+  let w_b = match wrong_pass_resp.body().to_string_utf8() {
+    Ok(s) => Ok(s),
+    Err(_) => Err(51),
+  }?;
+  let d_b = match disabled_resp.body().to_string_utf8() {
+    Ok(s) => Ok(s),
+    Err(_) => Err(52),
+  }?;
+  if g_b != unauth_body || w_b != unauth_body || d_b != unauth_body {
+    return Err(53);
+  }
+
+  // 12. 同時 PBKDF2 制限
+  service.active_pbkdf2 = 4;
+  let limited_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req, &remote_proxy, now_fn);
+  service.active_pbkdf2 = 0;
+  if limited_resp.status() != 429 {
+    return Err(54);
+  }
+
+  // 13. 要求のファジングと上限境界
+  // 不正 JSON
+  let bad_json_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{not json}";
+  let bad_json_req = match parse_raw_request(&bad_json_wire) {
+    Some(r) => Ok(r),
+    None => Err(55),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_json_req, &remote_proxy, now_fn).status() != 400 {
+    return Err(56);
+  }
+
+  // 未知キー
+  let extra_key_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 68\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\",\"admin\":true}";
+  let extra_key_req = match parse_raw_request(&extra_key_wire) {
+    Some(r) => Ok(r),
+    None => Err(57),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &extra_key_req, &remote_proxy, now_fn).status() != 400 {
+    return Err(58);
+  }
+
+  // 短すぎるパスワード (11文字)
+  let short_pass_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 45\r\n\r\n{\"username\":\"alice\",\"password\":\"shortpass10\"}";
+  let short_pass_req = match parse_raw_request(&short_pass_wire) {
+    Some(r) => Ok(r),
+    None => Err(59),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &short_pass_req, &remote_proxy, now_fn).status() != 400 {
+    return Err(60);
+  }
+
+  // 不正文字のユーザー名
+  let bad_user_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 56\r\n\r\n{\"username\":\"alice!\",\"password\":\"correct horse battery\"}";
+  let bad_user_req = match parse_raw_request(&bad_user_wire) {
+    Some(r) => Ok(r),
+    None => Err(61),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_user_req, &remote_proxy, now_fn).status() != 400 {
+    return Err(62);
+  }
+
+  // 14. 秘密がログ・応答に出ないことの検査
+  let log_text = log_event_text(AuthEvent.LoginSuccess, &Some(alice_user_id.clone()), &"127.0.0.1");
+  if string_contains(&log_text, &alice_pass) {
+    return Err(63);
+  }
+  if string_contains(&g_b, &alice_pass) || string_contains(&w_b, &alice_pass) {
+    return Err(64);
+  }
+
+  // 15. sigix の背後での結合（X-Forwarded-For）
+  let xff_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nX-Forwarded-For: 203.0.113.195\r\nContent-Length: 55\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\"}";
+  let xff_req = match parse_raw_request(&xff_wire) {
+    Some(r) => Ok(r),
+    None => Err(65),
+  }?;
+  let client_ip_trusted = extract_client_ip(&xff_req, &"127.0.0.1", &service.config.trusted_proxies);
+  if client_ip_trusted != "203.0.113.195" {
+    return Err(66);
+  }
+  let client_ip_untrusted = extract_client_ip(&xff_req, &"198.51.100.1", &service.config.trusted_proxies);
+  if client_ip_untrusted != "198.51.100.1" {
+    return Err(67);
+  }
+
+  let _ = close_persistent(kv);
+  return Ok(0);
+}
+
+pub fn main() -> Int
+  intent "段 4 の試験を実行し、成功で 0、失敗で 1 を返す"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  let users_dir = "rune_http_users_test_dir";
+  let kv_dir = "rune_http_kv_test_dir";
+  remove_tree(&users_dir);
+  remove_tree(&kv_dir);
+  let res = test_http_service(&users_dir, &kv_dir);
+  remove_tree(&users_dir);
+  remove_tree(&kv_dir);
+  return match res {
+    Ok(_) => 0,
+    Err(code) => code,
+  };
+}
