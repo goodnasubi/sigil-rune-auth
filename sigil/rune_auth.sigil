@@ -76,6 +76,15 @@ pub fn new_password(password: &Secret) -> Option<Bytes>
   };
 }
 
+fn compare_digest(digest: &Bytes, expected: &Bytes) -> Bool
+  intent "導出鍵と記録の導出鍵を定数時間で照合する"
+  requires none
+  ensures none
+  effects none
+{
+  return ct_eq(&digest, &expected);
+}
+
 pub fn verify_password(password: &Secret, record: &Bytes) -> Bool
   intent "公開の記録形式を検査してから導出鍵を定数時間で照合する"
   requires none
@@ -93,7 +102,7 @@ pub fn verify_password(password: &Secret, record: &Bytes) -> Bool
   let expected = record.slice(21, 53).unwrap_or(Bytes.new());
   let derived = pbkdf2_sha256(&password, &salt, iterations, 32);
   let digest = derived.expose();
-  let matches = ct_eq(&digest, &expected);
+  let matches = compare_digest(&digest, &expected);
   let wipe_digest = Secret.from_bytes(digest);
   let wipe_expected = Secret.from_bytes(expected);
   return matches;

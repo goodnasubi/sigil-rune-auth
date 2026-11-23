@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-sigil_sha=ba4a5f1b7bf4764521cdef1ee60daf1819d30f81
+sigil_sha=15beabc44aff08a0566abe3405d722e35b9b8aa5
 # sigil-db 核（ADR 0045）。段 2 は db/ の型付き関係 API とトランザクション API だけを使う。
 sigil_db_sha=9483e36f08c35bfc62b3beeb008a531887506037
 stash_sha=7dfcf15b24251d80904f8d54e54b735652b89303
@@ -57,8 +57,11 @@ cp -R "$db_root/db" "$root/db"
 mkdir -p "$root/stash"
 cp "$stash_root"/stash/{memory,persistent}.sigil "$root/stash/"
 cp "$repo_root"/sigil/*.sigil "$root/"
+# CLIF の子プロセスも --root 直下のマニフェストを読む。
+cp "$repo_root/Sigil.toml" "$root/"
 
 "$sigil" fmt --check "$repo_root"/sigil/*.sigil
+"$sigil" test --ct --root "$root"
 
 run_entry() {
   local entry=$1 label=$2 evaluator native

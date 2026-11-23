@@ -1,0 +1,4 @@
+[testing.constant_time]
+targets = [
+  { name = "rune_auth.compare_digest", public_args = [] },
+]
