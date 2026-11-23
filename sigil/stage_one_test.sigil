@@ -1,0 +1,234 @@
+module stage_one_test
+  targets server
+  trust none
+
+use rune_auth.decode_session;
+use rune_auth.encode_password;
+use rune_auth.encode_session;
+use rune_auth.issue_access_token;
+use rune_auth.new_session_id;
+use rune_auth.new_user_id;
+use rune_auth.session_key;
+use rune_auth.user_subject;
+use rune_auth.verify_password;
+
+fn sequence(count: Int) -> Bytes
+  intent "公開の試験入力 0, 1, 2, … を組み立てる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < count {
+    out.push(i);
+    i = i + 1;
+  }
+  return out;
+}
+
+fn repeated(count: Int, byte: Int) -> Bytes
+  intent "境界試験用のバイト列を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < count {
+    out.push(byte);
+    i = i + 1;
+  }
+  return out;
+}
+
+fn from_hex(text: &String) -> Bytes
+  intent "固定試験ベクタの小文字 hex をバイト列に戻す"
+  requires none
+  ensures none
+  effects none
+{
+  let ascii = text.as_bytes();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < ascii.byte_len() {
+    let mut hi = ascii.get(i).unwrap_or(0) - 48;
+    let mut lo = ascii.get(i + 1).unwrap_or(0) - 48;
+    if hi > 9 {
+      hi = hi - 39;
+    }
+    if lo > 9 {
+      lo = lo - 39;
+    }
+    out.push(hi * 16 + lo);
+    i = i + 2;
+  }
+  return out;
+}
+
+fn passwords() -> Int
+  intent "独立ベクタ、誤パスワードと記録形式、長さと反復回数の境界を検査する"
+  requires none
+  ensures none
+  effects task.suspend
+{
+  let password = Secret.from_bytes("correct horse".as_bytes());
+  let wrong = Secret.from_bytes("correct horsE".as_bytes());
+  let salt = sequence(16);
+  let record = encode_password(&password, &salt, 4096).unwrap_or(Bytes.new());
+  let vector = from_hex(&"0100001000000102030405060708090a0b0c0d0e0f8750ad7301ef1b2b80b2ce8deddc4b202af4decc15d43c39c9fcd2cb74dfb9ce");
+  if !ct_eq(&record, &vector) {
+    return 1;
+  }
+  if !verify_password(&password, &vector) || verify_password(&wrong, &vector) {
+    return 2;
+  }
+  if verify_password(&password, &vector.slice(0, 52).unwrap_or(Bytes.new())) {
+    return 3;
+  }
+  let mut bad_version = repeated(1, 2);
+  bad_version.extend(&vector.slice(1, 53).unwrap_or(Bytes.new()));
+  let mut bad_iterations = from_hex(&"01000186a1");
+  bad_iterations.extend(&vector.slice(5, 53).unwrap_or(Bytes.new()));
+  if verify_password(&password, &bad_version) || verify_password(&password, &bad_iterations) {
+    return 4;
+  }
+  let min = Secret.from_bytes(repeated(12, 120));
+  let short = Secret.from_bytes(repeated(11, 120));
+  let long = Secret.from_bytes(repeated(257, 120));
+  if encode_password(&min, &salt, 4096).is_none() || !encode_password(&short, &salt, 4096).is_none() || !encode_password(&long, &salt, 4096).is_none() {
+    return 5;
+  }
+  if !encode_password(&password, &sequence(15), 4096).is_none() || !encode_password(&password, &sequence(17), 4096).is_none() || !encode_password(&password, &salt, 4095).is_none() || !encode_password(&password, &salt, 100001).is_none() {
+    return 6;
+  }
+  let max = Secret.from_bytes(repeated(256, 120));
+  let max_record = encode_password(&max, &salt, 100000).unwrap_or(Bytes.new());
+  let max_vector = from_hex(&"01000186a0000102030405060708090a0b0c0d0e0fc9222c4b46c72f62b26100e066fddb906858cce426805670e06447baa2931a85");
+  if !ct_eq(&max_record, &max_vector) {
+    return 7;
+  }
+  return 0;
+}
+
+fn sessions() -> Int
+  intent "ID とセッション記録のベクタ、長さ、整数上限を検査する"
+  requires none
+  ensures none
+  effects random
+{
+  let user = sequence(16);
+  let id = sequence(32);
+  let subject = user_subject(&user).unwrap_or(Bytes.new());
+  if subject != "u000102030405060708090a0b0c0d0e0f".as_bytes() || !user_subject(&sequence(17)).is_none() {
+    return 10;
+  }
+  let key = session_key(&id).unwrap_or(Bytes.new());
+  if key != "rune:session:630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd".as_bytes() || !session_key(&sequence(31)).is_none() || !session_key(&sequence(33)).is_none() {
+    return 11;
+  }
+  if new_session_id().unwrap_or(Bytes.new()).byte_len() != 32 || new_user_id().unwrap_or(Bytes.new()).byte_len() != 16 {
+    return 12;
+  }
+  let vector = from_hex(&"01000102030405060708090a0b0c0d0e0f0000000000000007000000006553f1000000000065546180");
+  if encode_session(&user, 7, 1700000000, 1700028800).unwrap_or(Bytes.new()) != vector {
+    return 13;
+  }
+  match decode_session(&vector) {
+    None => {
+      return 14;
+    }
+    Some(decoded) => {
+      if decoded.user_id() != user || decoded.generation() != 7 || decoded.issued_at() != 1700000000 || decoded.expires_at() != 1700028800 {
+        return 15;
+      }
+    }
+  }
+  let max_encoded = encode_session(&user, 9223372036854775807, 9223372036854775806, 9223372036854775807).unwrap_or(Bytes.new());
+  if decode_session(&max_encoded).is_none() {
+    return 16;
+  }
+  let over = from_hex(&"01000102030405060708090a0b0c0d0e0f8000000000000000000000006553f1000000000065546180");
+  let mut bad_version = repeated(1, 2);
+  bad_version.extend(&vector.slice(1, 41).unwrap_or(Bytes.new()));
+  if !decode_session(&over).is_none() || !encode_session(&user, 0, 1700000000, 1700000000).is_none() || !decode_session(&bad_version).is_none() || !decode_session(&vector.slice(0, 40).unwrap_or(Bytes.new())).is_none() {
+    return 17;
+  }
+  return 0;
+}
+
+fn rejects(key: &Secret, audience: &String, token: &Bytes, now: Int) -> Bool
+  intent "検証器が公開の試験トークンを拒否したか確認する"
+  requires none
+  ensures none
+  effects none
+{
+  return match web.verify_bearer(&key, &audience, &token, now) {
+    Ok(_) => false,
+    Err(_) => true,
+  };
+}
+
+fn tokens() -> Int
+  intent "独立ベクタと ADR 0037 検証器の往復および発行境界を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let key = Secret.from_bytes(sequence(32));
+  let wrong_key = Secret.from_bytes(repeated(32, 0));
+  let user = sequence(16);
+  let aud = "sigil.api";
+  let now = 1700000000;
+  let token = issue_access_token(&key, &aud, &user, now, 300).unwrap_or(Bytes.new());
+  if token != "sigil1.AAAAAGVT8QAAAAAAZVPyLAAJc2lnaWwuYXBpACF1MDAwMTAyMDMwNDA1MDYwNzA4MDkwYTBiMGMwZDBlMGY.JNgn5FWROT2DVF4JmZrI_dHKtj9IcIZjlEQPgR3oKnU".as_bytes() {
+    return 20;
+  }
+  match web.verify_bearer(&key, &aud, &token, now) {
+    Err(_) => {
+      return 21;
+    }
+    Ok(identity) => {
+      if identity.subject() != "u000102030405060708090a0b0c0d0e0f" {
+        return 22;
+      }
+    }
+  }
+  if !rejects(&wrong_key, &aud, &token, now) || !rejects(&key, &"other.api", &token, now) || !rejects(&key, &aud, &token, now - 1) || !rejects(&key, &aud, &token, now + 300) || rejects(&key, &aud, &token, now + 299) {
+    return 23;
+  }
+  let max_aud = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  let over_aud = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB";
+  let max_iat = 253402297199;
+  let max_token = issue_access_token(&key, &max_aud, &user, max_iat, 3600).unwrap_or(Bytes.new());
+  let min_token = issue_access_token(&key, &"a", &user, 0, 60).unwrap_or(Bytes.new());
+  if rejects(&key, &max_aud, &max_token, 253402300798) || rejects(&key, &"a", &min_token, 0) {
+    return 24;
+  }
+  if !issue_access_token(&key, &over_aud, &user, now, 300).is_none() || !issue_access_token(&key, &"", &user, now, 300).is_none() || !issue_access_token(&key, &"a/b", &user, now, 300).is_none() || !issue_access_token(&key, &"日本語", &user, now, 300).is_none() || !issue_access_token(&key, &aud, &user, -1, 60).is_none() || !issue_access_token(&key, &aud, &user, max_iat + 1, 3600).is_none() || !issue_access_token(&key, &aud, &user, now, 3601).is_none() || !issue_access_token(&key, &aud, &user, now, 59).is_none() {
+    return 25;
+  }
+  let short = Secret.from_bytes(sequence(31));
+  let long = Secret.from_bytes(sequence(33));
+  if !issue_access_token(&short, &aud, &user, now, 300).is_none() || !issue_access_token(&long, &aud, &user, now, 300).is_none() || !issue_access_token(&key, &aud, &sequence(15), now, 300).is_none() {
+    return 26;
+  }
+  return 0;
+}
+
+fn main() -> Int
+  intent "評価器とネイティブで共有する段 1 の試験を実行する"
+  requires none
+  ensures none
+  effects random, task.suspend
+{
+  let session_result = sessions();
+  if session_result != 0 {
+    return session_result;
+  }
+  let token_result = tokens();
+  if token_result != 0 {
+    return token_result;
+  }
+  return passwords();
+}
