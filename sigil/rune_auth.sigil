@@ -117,7 +117,7 @@ pub fn new_user_id() -> Option<Bytes>
   return random.bytes(16);
 }
 
-fn hex(data: &Bytes) -> Bytes
+pub fn hex(data: &Bytes) -> Bytes
   intent "公開する ID またはハッシュを小文字 hex にする"
   requires none
   ensures none

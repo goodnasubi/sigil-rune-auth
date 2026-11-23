@@ -4,6 +4,7 @@ set -euo pipefail
 sigil_sha=ba4a5f1b7bf4764521cdef1ee60daf1819d30f81
 # sigil-db 核（ADR 0045）。段 2 は db/ の型付き関係 API とトランザクション API だけを使う。
 sigil_db_sha=9483e36f08c35bfc62b3beeb008a531887506037
+stash_sha=7dfcf15b24251d80904f8d54e54b735652b89303
 rust_version=1.100.0
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 scratch=$(mktemp -d)
@@ -33,6 +34,13 @@ fi
 test "$(git -C "$db_root" rev-parse HEAD)" = "$sigil_db_sha"
 test -z "$(git -C "$db_root" status --porcelain --untracked-files=all)"
 
+stash_root=${SIGIL_STASH_KV:-"$scratch/sigil-stash-kv"}
+if [[ -z ${SIGIL_STASH_KV:-} ]]; then
+  fetch_pinned https://github.com/goodnasubi/sigil-stash-kv.git "$stash_sha" "$stash_root"
+fi
+test "$(git -C "$stash_root" rev-parse HEAD)" = "$stash_sha"
+test -z "$(git -C "$stash_root" status --porcelain --untracked-files=all)"
+
 cd "$sigil_root"
 rustup toolchain install "$rust_version" --profile minimal --component rustfmt --component clippy
 cargo +"$rust_version" fmt --check
@@ -46,6 +54,8 @@ sigil="$cargo_target/release/sigil"
 root="$scratch/root"
 mkdir -p "$root"
 cp -R "$db_root/db" "$root/db"
+mkdir -p "$root/stash"
+cp "$stash_root"/stash/{memory,persistent}.sigil "$root/stash/"
 cp "$repo_root"/sigil/*.sigil "$root/"
 
 "$sigil" fmt --check "$repo_root"/sigil/*.sigil
@@ -72,6 +82,7 @@ run_entry stage_two_throttle_test "Stage 2 throttle"
 run_entry stage_two_users_test "Stage 2 users and login"
 run_entry stage_two_recovery_test "Stage 2 interruption and recovery"
 run_entry stage_two_cli_test "Stage 2 CLI commands"
+run_entry stage_three_sessions_test "Stage 3 persistent sessions"
 
 # Smoke test of the real command line: argument reading, exit codes and the output of the native executable.
 # The one `register` below uses the full 100,000 iterations of the production setting.
@@ -106,4 +117,4 @@ expect_exit 0 "$cli" disable "--dir=$dir" --user=alice
 expect_exit 3 "$cli" disable "--dir=$dir" --user=ghost
 expect_exit 2 "$cli" bogus "--dir=$dir" --user=alice
 printf 'CLI smoke test passed.\n'
-printf 'Stage 1 and stage 2 evaluator and native tests passed.\n'
+printf 'Stage 1 through stage 3 evaluator and native tests passed.\n'
