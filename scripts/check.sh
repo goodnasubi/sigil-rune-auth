@@ -57,9 +57,11 @@ cp -R "$db_root/db" "$root/db"
 mkdir -p "$root/stash"
 cp "$stash_root"/stash/{memory,persistent}.sigil "$root/stash/"
 cp "$repo_root"/sigil/*.sigil "$root/"
+# CLIF の子プロセスも --root 直下のマニフェストを読む。
+cp "$repo_root/Sigil.toml" "$root/"
 
 "$sigil" fmt --check "$repo_root"/sigil/*.sigil
-"$sigil" test --ct --root "$root" --manifest "$repo_root/Sigil.toml"
+"$sigil" test --ct --root "$root"
 
 run_entry() {
   local entry=$1 label=$2 evaluator native
