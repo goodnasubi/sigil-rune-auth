@@ -1,0 +1,290 @@
+module rune_throttle
+  targets server
+  trust none
+
+// ADR 0060 段 2: 利用者名ごとのログイン失敗の抑制。プロセス内だけで持ち、再起動で消える。
+// 呼び出し側が現在の UTC Unix 秒を渡す。時刻が戻っても、見た中で最大の時刻に丸めるので、拒否が早く解けることはない。
+// 追跡する利用者名の数には上限がある。満杯のときは、窓が過ぎた記録を捨て、それでも満杯なら拒否中でない記録のうち窓の開始が最も古いものを捨てる（全部が拒否中なら最も古いもの）。
+
+pub struct Attempt {
+  attempt_key: Bytes,
+  window_start: Int,
+  failures: Int,
+  locked_until: Int,
+}
+
+pub struct Throttle {
+  entries: List<Attempt>,
+  last_now: Int,
+  limit: Int,
+}
+
+pub fn window_seconds() -> Int
+  intent "失敗を数える窓の長さ（秒）。窓は最初の失敗から始まる"
+  requires none
+  ensures none
+  effects none
+{
+  return 900;
+}
+
+pub fn max_failures() -> Int
+  intent "窓の中でこの回数に達した失敗で拒否に入る"
+  requires none
+  ensures none
+  effects none
+{
+  return 5;
+}
+
+pub fn lockout_seconds() -> Int
+  intent "拒否の長さ（秒）"
+  requires none
+  ensures none
+  effects none
+{
+  return 900;
+}
+
+pub fn default_capacity() -> Int
+  intent "追跡する利用者名の既定の上限"
+  requires none
+  ensures none
+  effects none
+{
+  return 1024;
+}
+
+pub fn throttle_with_capacity(capacity: Int) -> Throttle
+  intent "追跡数の上限を指定して空の抑制状態を作る（上限は 1 以上に丸める）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut limit = capacity;
+  if limit < 1 {
+    limit = 1;
+  }
+  return Throttle { entries: List.new(), last_now: 0, limit: limit };
+}
+
+pub fn new_throttle() -> Throttle
+  intent "既定の上限で空の抑制状態を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return throttle_with_capacity(default_capacity());
+}
+
+pub fn throttle_key(username: &Bytes) -> Bytes
+  intent "任意の入力の利用者名を、長さが一定の追跡キー（SHA-256）にする"
+  requires none
+  ensures none
+  effects none
+{
+  return sha256(&username);
+}
+
+pub fn tracked(throttle: &Throttle) -> Int
+  intent "追跡している利用者名の数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return throttle.entries.len();
+}
+
+fn clamp(throttle: &mut Throttle, now: Int) -> Int
+  intent "時刻を、見た中で最大の時刻以上に丸める"
+  requires none
+  ensures none
+  effects none
+{
+  let mut t = now;
+  if t < throttle.last_now {
+    t = throttle.last_now;
+  }
+  throttle.last_now = t;
+  return t;
+}
+
+fn find(throttle: &Throttle, key: &Bytes) -> Int
+  intent "キーの記録の位置を返す。無ければ -1"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < throttle.entries.len() {
+    match throttle.entries.get(i) {
+      None => {}
+      Some(a) => {
+        if a.attempt_key == key {
+          return i;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn expired(a: &Attempt, now: Int) -> Bool
+  intent "窓も拒否も過ぎた記録か"
+  requires none
+  ensures none
+  effects none
+{
+  return a.locked_until <= now && now >= a.window_start + window_seconds();
+}
+
+fn make_room(throttle: &mut Throttle, now: Int)
+  intent "満杯のとき、期限の過ぎた記録を捨て、それでも満杯なら拒否中でない記録のうち窓の開始が最も古い 1 件を（全部が拒否中なら全体で最も古い 1 件を）捨てる"
+  requires none
+  ensures none
+  effects none
+{
+  if throttle.entries.len() < throttle.limit {
+    return;
+  }
+  let mut kept = List.new();
+  let mut i = 0;
+  while i < throttle.entries.len() {
+    match throttle.entries.get(i) {
+      None => {}
+      Some(a) => {
+        if !expired(&a, now) {
+          kept.push(Attempt { attempt_key: a.attempt_key.clone(), window_start: a.window_start, failures: a.failures, locked_until: a.locked_until });
+        }
+      }
+    }
+    i = i + 1;
+  }
+  if kept.len() < throttle.limit {
+    throttle.entries = kept;
+    return;
+  }
+  let mut victim = -1;
+  let mut victim_start = 0;
+  let mut victim_locked = true;
+  let mut j = 0;
+  while j < kept.len() {
+    match kept.get(j) {
+      None => {}
+      Some(a) => {
+        let locked = a.locked_until > now;
+        let better = victim < 0 || (victim_locked && !locked) || (victim_locked == locked && a.window_start < victim_start);
+        if better {
+          victim = j;
+          victim_start = a.window_start;
+          victim_locked = locked;
+        }
+      }
+    }
+    j = j + 1;
+  }
+  let mut trimmed = List.new();
+  let mut k = 0;
+  while k < kept.len() {
+    if k != victim {
+      match kept.get(k) {
+        None => {}
+        Some(a) => {
+          trimmed.push(Attempt { attempt_key: a.attempt_key.clone(), window_start: a.window_start, failures: a.failures, locked_until: a.locked_until });
+        }
+      }
+    }
+    k = k + 1;
+  }
+  throttle.entries = trimmed;
+}
+
+pub fn lock_remaining(throttle: &mut Throttle, key: &Bytes, now: Int) -> Int
+  intent "拒否中なら解けるまでの残り秒数（1 以上）を、拒否中でなければ 0 を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let t = clamp(&mut throttle, now);
+  let idx = find(&throttle, &key);
+  if idx < 0 {
+    return 0;
+  }
+  let mut remaining = 0;
+  match throttle.entries.get(idx) {
+    None => {}
+    Some(a) => {
+      if a.locked_until > t {
+        remaining = a.locked_until - t;
+      }
+    }
+  }
+  return remaining;
+}
+
+pub fn record_failure(throttle: &mut Throttle, key: &Bytes, now: Int)
+  intent "失敗を 1 回数える。窓の中で上限に達したら拒否に入る。拒否中の失敗は数えない"
+  requires none
+  ensures none
+  effects none
+{
+  let t = clamp(&mut throttle, now);
+  let idx = find(&throttle, &key);
+  if idx < 0 {
+    make_room(&mut throttle, t);
+    throttle.entries.push(Attempt { attempt_key: key.clone(), window_start: t, failures: 1, locked_until: 0 });
+    if max_failures() <= 1 {
+      let last = throttle.entries.len() - 1;
+      match throttle.entries.get_mut(last) {
+        None => {}
+        Some(a) => {
+          a.locked_until = t + lockout_seconds();
+        }
+      }
+    }
+    return;
+  }
+  match throttle.entries.get_mut(idx) {
+    None => {}
+    Some(a) => {
+      if a.locked_until > t {
+        return;
+      }
+      if t >= a.window_start + window_seconds() {
+        a.window_start = t;
+        a.failures = 1;
+        a.locked_until = 0;
+      } else {
+        a.failures = a.failures + 1;
+      }
+      if a.failures >= max_failures() {
+        a.locked_until = t + lockout_seconds();
+      }
+    }
+  }
+}
+
+pub fn record_success(throttle: &mut Throttle, key: &Bytes, now: Int)
+  intent "認証の成功で、その利用者名の失敗の記録を消す。拒否中の記録は消さない"
+  requires none
+  ensures none
+  effects none
+{
+  let t = clamp(&mut throttle, now);
+  let idx = find(&throttle, &key);
+  if idx < 0 {
+    return;
+  }
+  match throttle.entries.get_mut(idx) {
+    None => {}
+    Some(a) => {
+      if a.locked_until > t {
+        return;
+      }
+      a.window_start = 0;
+      a.failures = 0;
+      a.locked_until = 0;
+    }
+  }
+}

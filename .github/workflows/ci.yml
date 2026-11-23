@@ -1,4 +1,4 @@
-name: Stage 1
+name: CI
 
 on:
   push:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: 4
     steps:

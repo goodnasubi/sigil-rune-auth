@@ -1,0 +1,120 @@
+module rune_login
+  targets server
+  trust none
+
+use rune_auth.verify_password;
+use rune_throttle.Throttle;
+use rune_throttle.lock_remaining;
+use rune_throttle.record_failure;
+use rune_throttle.record_success;
+use rune_throttle.throttle_key;
+use rune_users.UserError;
+use rune_users.UserStore;
+use rune_users.lookup_user;
+use rune_users.new_record;
+use rune_users.status_active;
+use rune_users.upgrade_record;
+
+// ADR 0060 段 2: ログイン照合。
+//
+// 応答の一様性: 未知の利用者、書式の不正な利用者名、無効な利用者、誤ったパスワードは、どれも同じ `Failed` になり、
+// どれも PBKDF2 の照合を 1 回行う（未知・不正な名前は起動時に作ったダミーの記録で照合する）。
+// 拒否中（`Throttled`）は利用者名の実在によらず、同じ条件で返る。拒否中は DB にも PBKDF2 にも触れない。
+// パスワードが長さの規則（12〜256 バイト）に合わない場合は PBKDF2 を行わず `Failed` になる。規則は公開されている。
+// 成功のとき、保存された記録の反復回数が店の設定より少なければ、同じパスワードで新しい記録に置き換える（再計算による移行）。
+
+pub enum LoginOutcome {
+  Success(Bytes, Int),
+  Failed,
+  Throttled(Int),
+}
+
+pub struct LoginGate {
+  throttle: Throttle,
+  dummy_record: Bytes,
+}
+
+pub fn new_login_gate(store: &UserStore, throttle: Throttle) -> Result<LoginGate, UserError>
+  intent "抑制の状態と、未知の利用者の照合に使うダミーの記録（店の反復回数・新しい塩・捨てる乱数のパスワード）を持つ入口を作る"
+  requires none
+  ensures none
+  effects random, task.suspend
+{
+  let noise = random.bytes(32);
+  if noise.is_none() {
+    return Err(UserError.EntropyUnavailable);
+  }
+  let password = Secret.from_bytes(noise.unwrap_or(Bytes.new()));
+  let record = new_record(&store, &password)?;
+  return Ok(LoginGate { throttle: throttle, dummy_record: record });
+}
+
+fn stored_iterations(record: &Bytes) -> Int
+  intent "版 1 の記録から反復回数（先頭の次の 4 バイト、大端）を読む。形式が違えば 0"
+  requires none
+  ensures none
+  effects none
+{
+  if record.byte_len() != 53 {
+    return 0;
+  }
+  let mut value = 0;
+  let mut i = 1;
+  while i < 5 {
+    value = value * 256 + record.get(i).unwrap_or(0);
+    i = i + 1;
+  }
+  return value;
+}
+
+fn migrate(store: &mut UserStore, username: &Bytes, password: &Secret, record: &Bytes)
+  intent "記録の反復回数が店の設定より少ないとき、新しい記録に置き換える。失敗してもログインの結果は変えない"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  if stored_iterations(&record) >= store.iterations {
+    return;
+  }
+  match new_record(&store, &password) {
+    Err(_) => {}
+    Ok(upgraded) => {
+      let _ = upgrade_record(&mut store, &username, &record, &upgraded);
+    }
+  }
+}
+
+pub fn login(store: &mut UserStore, gate: &mut LoginGate, username: &Bytes, password: &Secret, now: Int) -> Result<LoginOutcome, UserError>
+  intent "利用者名とパスワードを照合する。拒否中なら何にも触れず Throttled。それ以外は常に 1 回の PBKDF2 を行い、成功か一様な Failed を返す"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  let key = throttle_key(&username);
+  let wait = lock_remaining(&mut gate.throttle, &key, now);
+  if wait > 0 {
+    return Ok(LoginOutcome.Throttled(wait));
+  }
+  let found = lookup_user(&mut store, &username)?;
+  let mut record = gate.dummy_record.clone();
+  let mut usable = false;
+  let mut user_id = Bytes.new();
+  let mut generation = 0;
+  match found {
+    None => {}
+    Some(row) => {
+      record = row.row_record.clone();
+      usable = row.row_status == status_active();
+      user_id = row.row_user_id.clone();
+      generation = row.row_generation;
+    }
+  }
+  let matched = verify_password(&password, &record);
+  if usable && matched {
+    record_success(&mut gate.throttle, &key, now);
+    migrate(&mut store, &username, &password, &record);
+    return Ok(LoginOutcome.Success(user_id, generation));
+  }
+  record_failure(&mut gate.throttle, &key, now);
+  return Ok(LoginOutcome.Failed);
+}

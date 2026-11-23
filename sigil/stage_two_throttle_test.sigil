@@ -1,0 +1,269 @@
+module stage_two_throttle_test
+  targets server
+  trust none
+
+use rune_throttle.Throttle;
+use rune_throttle.lock_remaining;
+use rune_throttle.new_throttle;
+use rune_throttle.record_failure;
+use rune_throttle.record_success;
+use rune_throttle.throttle_key;
+use rune_throttle.throttle_with_capacity;
+use rune_throttle.tracked;
+
+// ADR 0060 段 2 の抑制の境界試験。純粋で、時刻は引数で渡す。
+// 規則: 窓は最初の失敗から 900 秒、窓の中で 5 回目の失敗で 900 秒の拒否に入る。
+
+fn key(name: &String) -> Bytes
+  intent "試験用の追跡キー"
+  requires none
+  ensures none
+  effects none
+{
+  return throttle_key(&name.as_bytes());
+}
+
+fn fail_at(throttle: &mut Throttle, name: &String, times: Int, start: Int)
+  intent "start から 1 秒おきに times 回の失敗を記録する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < times {
+    record_failure(&mut throttle, &key(&name), start + i);
+    i = i + 1;
+  }
+}
+
+fn boundary_of_five() -> Int
+  intent "4 回では拒否に入らず、5 回目で入る。残りは 900 から 1 まで減り、ちょうど解ける秒で 0 になる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut t = new_throttle();
+  fail_at(&mut t, &"alice", 4, 100);
+  if lock_remaining(&mut t, &key(&"alice"), 103) != 0 {
+    return 1;
+  }
+  record_failure(&mut t, &key(&"alice"), 104);
+  if lock_remaining(&mut t, &key(&"alice"), 104) != 900 {
+    return 2;
+  }
+  if lock_remaining(&mut t, &key(&"alice"), 500) != 504 {
+    return 3;
+  }
+  if lock_remaining(&mut t, &key(&"alice"), 1003) != 1 {
+    return 4;
+  }
+  if lock_remaining(&mut t, &key(&"alice"), 1004) != 0 {
+    return 5;
+  }
+  return 0;
+}
+
+fn lock_is_not_extended() -> Int
+  intent "拒否中の失敗は数えず、拒否を延ばさない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut t = new_throttle();
+  fail_at(&mut t, &"alice", 5, 0);
+  record_failure(&mut t, &key(&"alice"), 400);
+  record_failure(&mut t, &key(&"alice"), 800);
+  if lock_remaining(&mut t, &key(&"alice"), 903) != 1 {
+    return 11;
+  }
+  if lock_remaining(&mut t, &key(&"alice"), 904) != 0 {
+    return 12;
+  }
+  // 拒否が解けた直後の失敗は、新しい窓の 1 回目になる。
+  record_failure(&mut t, &key(&"alice"), 904);
+  fail_at(&mut t, &"alice", 3, 905);
+  if lock_remaining(&mut t, &key(&"alice"), 908) != 0 {
+    return 13;
+  }
+  record_failure(&mut t, &key(&"alice"), 909);
+  if lock_remaining(&mut t, &key(&"alice"), 909) != 900 {
+    return 14;
+  }
+  return 0;
+}
+
+fn window_boundary() -> Int
+  intent "窓の最後の秒の 5 回目は拒否に入り、窓が過ぎてからの失敗は数え直しになる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut inside = new_throttle();
+  fail_at(&mut inside, &"alice", 4, 0);
+  record_failure(&mut inside, &key(&"alice"), 899);
+  if lock_remaining(&mut inside, &key(&"alice"), 899) != 900 {
+    return 21;
+  }
+  let mut outside = new_throttle();
+  fail_at(&mut outside, &"alice", 4, 0);
+  record_failure(&mut outside, &key(&"alice"), 900);
+  if lock_remaining(&mut outside, &key(&"alice"), 900) != 0 {
+    return 22;
+  }
+  // 900 秒から数え直した窓で、あと 3 回は拒否に入らず、4 回目（通算 5 回目）で入る。
+  fail_at(&mut outside, &"alice", 3, 901);
+  if lock_remaining(&mut outside, &key(&"alice"), 903) != 0 {
+    return 23;
+  }
+  record_failure(&mut outside, &key(&"alice"), 904);
+  if lock_remaining(&mut outside, &key(&"alice"), 904) != 900 {
+    return 24;
+  }
+  return 0;
+}
+
+fn success_clears() -> Int
+  intent "成功で失敗の記録が消える。拒否中は消えない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut t = new_throttle();
+  fail_at(&mut t, &"alice", 4, 0);
+  record_success(&mut t, &key(&"alice"), 10);
+  fail_at(&mut t, &"alice", 4, 20);
+  if lock_remaining(&mut t, &key(&"alice"), 24) != 0 {
+    return 31;
+  }
+  record_failure(&mut t, &key(&"alice"), 24);
+  if lock_remaining(&mut t, &key(&"alice"), 24) != 900 {
+    return 32;
+  }
+  record_success(&mut t, &key(&"alice"), 30);
+  if lock_remaining(&mut t, &key(&"alice"), 30) != 894 {
+    return 33;
+  }
+  return 0;
+}
+
+fn names_are_independent() -> Int
+  intent "利用者名ごとに別々に数え、未知の名前も同じ規則で拒否される"
+  requires none
+  ensures none
+  effects none
+{
+  let mut t = new_throttle();
+  fail_at(&mut t, &"alice", 5, 0);
+  fail_at(&mut t, &"ghost-user-that-does-not-exist", 5, 0);
+  if lock_remaining(&mut t, &key(&"alice"), 10) != 894 {
+    return 41;
+  }
+  if lock_remaining(&mut t, &key(&"ghost-user-that-does-not-exist"), 10) != 894 {
+    return 42;
+  }
+  if lock_remaining(&mut t, &key(&"bob"), 10) != 0 {
+    return 43;
+  }
+  if key(&"alice") != key(&"alice") || key(&"alice") == key(&"Alice") {
+    return 44;
+  }
+  // 長い入力でもキーは一定の長さ。
+  let mut long = Bytes.new();
+  let mut i = 0;
+  while i < 5000 {
+    long.push(97);
+    i = i + 1;
+  }
+  if throttle_key(&long).byte_len() != 32 || throttle_key(&Bytes.new()).byte_len() != 32 {
+    return 45;
+  }
+  return 0;
+}
+
+fn time_never_runs_backwards() -> Int
+  intent "時刻が戻っても、拒否が早く解けることはない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut t = new_throttle();
+  fail_at(&mut t, &"alice", 5, 100);
+  if lock_remaining(&mut t, &key(&"alice"), 50) != 900 {
+    return 51;
+  }
+  if lock_remaining(&mut t, &key(&"alice"), 0) != 900 {
+    return 52;
+  }
+  return 0;
+}
+
+fn capacity_is_bounded() -> Int
+  intent "追跡数は上限を超えない。期限切れを先に捨て、拒否中の記録は最後まで残す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut t = throttle_with_capacity(3);
+  fail_at(&mut t, &"locked", 5, 0);
+  record_failure(&mut t, &key(&"b"), 10);
+  record_failure(&mut t, &key(&"c"), 11);
+  if tracked(&t) != 3 {
+    return 61;
+  }
+  // 満杯で期限切れは無い。拒否中でない記録のうち最も古い b が捨てられ、拒否中の locked は残る。
+  record_failure(&mut t, &key(&"d"), 20);
+  if tracked(&t) != 3 {
+    return 62;
+  }
+  if lock_remaining(&mut t, &key(&"locked"), 21) != 883 {
+    return 63;
+  }
+  // 窓が過ぎた記録（c と d）は、次の追加で先に捨てられる。
+  record_failure(&mut t, &key(&"e"), 1000);
+  if tracked(&t) > 3 {
+    return 64;
+  }
+  // 全部が拒否中のときは、最も古い拒否が捨てられる。
+  let mut all = throttle_with_capacity(2);
+  fail_at(&mut all, &"x", 5, 0);
+  fail_at(&mut all, &"y", 5, 1);
+  fail_at(&mut all, &"z", 5, 2);
+  if tracked(&all) != 2 {
+    return 65;
+  }
+  if lock_remaining(&mut all, &key(&"x"), 3) != 0 {
+    return 66;
+  }
+  if lock_remaining(&mut all, &key(&"z"), 3) == 0 {
+    return 67;
+  }
+  return 0;
+}
+
+pub fn main() -> Int
+  intent "抑制の境界試験をすべて実行し、通れば 0、落ちた試験の番号を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut code = boundary_of_five();
+  if code == 0 {
+    code = lock_is_not_extended();
+  }
+  if code == 0 {
+    code = window_boundary();
+  }
+  if code == 0 {
+    code = success_clears();
+  }
+  if code == 0 {
+    code = names_are_independent();
+  }
+  if code == 0 {
+    code = time_never_runs_backwards();
+  }
+  if code == 0 {
+    code = capacity_is_bounded();
+  }
+  return code;
+}

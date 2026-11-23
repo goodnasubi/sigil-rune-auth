@@ -1,0 +1,328 @@
+module stage_two_recovery_test
+  targets server
+  trust none
+
+use db.iohook.act_crash;
+use db.iohook.act_fail_io;
+use db.iohook.act_torn;
+use db.iohook.io_fault;
+use rune_users.UserError;
+use rune_users.UserStore;
+use rune_users.bump_generation;
+use rune_users.close_users;
+use rune_users.disable_user;
+use rune_users.insert_user;
+use rune_users.is_stopped;
+use rune_users.lookup_user;
+use rune_users.open_users;
+use rune_users.replace_password;
+use rune_users.status_active;
+use rune_users.status_disabled;
+use stage_two_support.fixed_record;
+use stage_two_support.fresh;
+use stage_two_support.low_iterations;
+use stage_two_support.remove_tree;
+
+// ADR 0060 段 2: 中断・復旧の試験。「再起動」は、閉じて同じディレクトリを開き直すこと（核の WAL 復旧が走る）。
+// 故障は核自身の I/O の関門（db.iohook）から入れる。ページや WAL を直接壊さない。
+// 4 つの更新を順に行う。k 個が済んだ後の期待する行:
+//   0: 行なし／1: 記録 R1・世代 0・有効／2: R2・世代 1・有効／3: R2・世代 2・有効／4: R2・世代 2・無効
+// 記録と世代を一緒に変える更新（2 つ目）が半分だけ見えることはない。
+
+fn name() -> Bytes
+  intent "試験の利用者名"
+  requires none
+  ensures none
+  effects none
+{
+  return "alice".as_bytes();
+}
+
+fn r1() -> Bytes
+  intent "1 つ目のパスワード記録"
+  requires none
+  ensures none
+  effects task.suspend
+{
+  return fixed_record(&"first-password-1", 1, 4096);
+}
+
+fn r2() -> Bytes
+  intent "2 つ目のパスワード記録"
+  requires none
+  ensures none
+  effects task.suspend
+{
+  return fixed_record(&"second-password-2", 2, 4096);
+}
+
+fn reopen(store: UserStore, dir: &String) -> Result<UserStore, UserError>
+  intent "閉じて同じディレクトリを開き直す。WAL の復旧が走る"
+  requires none
+  ensures none
+  effects fs
+{
+  close_users(store)?;
+  return open_users(dir.clone(), low_iterations());
+}
+
+fn do_op(store: &mut UserStore, i: Int, first: &Bytes, second: &Bytes) -> Result<Int, UserError>
+  intent "i 番目の更新を行う"
+  requires none
+  ensures none
+  effects fs, random
+{
+  if i == 0 {
+    insert_user(&mut store, &name(), &first, 1000)?;
+  }
+  if i == 1 {
+    replace_password(&mut store, &name(), &second)?;
+  }
+  if i == 2 {
+    bump_generation(&mut store, &name())?;
+  }
+  if i == 3 {
+    disable_user(&mut store, &name())?;
+  }
+  return Ok(0);
+}
+
+fn row_is(store: &mut UserStore, present: Bool, record: &Bytes, generation: Int, status: Int) -> Bool
+  intent "利用者名の索引で引いた行が、期待どおり（無い、または記録・世代・状態が一致）か"
+  requires none
+  ensures none
+  effects fs
+{
+  return match lookup_user(&mut store, &name()) {
+    Ok(None) => !present,
+    Ok(Some(row)) => present && row.row_record == record.clone() && row.row_generation == generation && row.row_status == status,
+    Err(_) => false,
+  };
+}
+
+fn matches_after(store: &mut UserStore, k: Int, first: &Bytes, second: &Bytes) -> Bool
+  intent "k 個の更新の後の期待する行と一致するか"
+  requires none
+  ensures none
+  effects fs
+{
+  if k == 0 {
+    return row_is(&mut store, false, &first, 0, 0);
+  }
+  if k == 1 {
+    return row_is(&mut store, true, &first, 0, status_active());
+  }
+  if k == 2 {
+    return row_is(&mut store, true, &second, 1, status_active());
+  }
+  if k == 3 {
+    return row_is(&mut store, true, &second, 2, status_active());
+  }
+  return row_is(&mut store, true, &second, 2, status_disabled());
+}
+
+fn restart_keeps_updates(dir: &String, first: &Bytes, second: &Bytes) -> Result<Int, UserError>
+  intent "返事のあった更新は再起動後も残り、世代は戻らない"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let mut store = fresh(&dir, low_iterations())?;
+  let mut i = 0;
+  while i < 4 {
+    do_op(&mut store, i, &first, &second)?;
+    i = i + 1;
+  }
+  let mut again = reopen(store, &dir)?;
+  if !matches_after(&mut again, 4, &first, &second) {
+    return Ok(101);
+  }
+  let mut third = reopen(again, &dir)?;
+  if !matches_after(&mut third, 4, &first, &second) {
+    return Ok(102);
+  }
+  close_users(third)?;
+  return Ok(0);
+}
+
+fn stopped_after_unknown_commit(dir: &String, step: Int, first: &Bytes, second: &Bytes) -> Result<Int, UserError>
+  intent "WAL の書き込みか同期の失敗は成否不明として店を止め、開き直すまで何も受けない。復旧後は動く"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let mut store = fresh(&dir, low_iterations())?;
+  do_op(&mut store, 0, &first, &second)?;
+  store.database.io.step = 0;
+  store.database.io.faults.push(io_fault(step, act_fail_io(), 0));
+  match bump_generation(&mut store, &name()) {
+    Err(UserError.CommitUnknown) => {}
+    _ => {
+      return Ok(111);
+    }
+  }
+  if !is_stopped(&store) {
+    return Ok(112);
+  }
+  match lookup_user(&mut store, &name()) {
+    Err(UserError.Stopped) => {}
+    _ => {
+      return Ok(113);
+    }
+  }
+  match disable_user(&mut store, &name()) {
+    Err(UserError.Stopped) => {}
+    _ => {
+      return Ok(114);
+    }
+  }
+  let mut again = reopen(store, &dir)?;
+  if is_stopped(&again) {
+    return Ok(115);
+  }
+  // 成否不明だった更新は、完全に入っているか、まったく入っていないかのどちらか。
+  let applied = row_is(&mut again, true, &first, 1, status_active());
+  let absent = row_is(&mut again, true, &first, 0, status_active());
+  if !applied && !absent {
+    return Ok(116);
+  }
+  // 復旧後は、また更新できる。
+  bump_generation(&mut again, &name())?;
+  close_users(again)?;
+  return Ok(0);
+}
+
+fn count_steps(dir: &String, first: &Bytes, second: &Bytes) -> Result<Int, UserError>
+  intent "故障なしで 4 つの更新を行い、通った I/O の関門の数を返す"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let mut store = fresh(&dir, low_iterations())?;
+  store.database.io.step = 0;
+  let mut i = 0;
+  while i < 4 {
+    do_op(&mut store, i, &first, &second)?;
+    i = i + 1;
+  }
+  let steps = store.database.io.step;
+  close_users(store)?;
+  return Ok(steps);
+}
+
+fn run_fault(dir: &String, step: Int, act: Int, n: Int, first: &Bytes, second: &Bytes) -> Result<Int, UserError>
+  intent "故障を 1 つ入れ、最初の失敗で止め、再起動して行を期待と比べる。同じ名前の登録が、行の有無と食い違わないことも見る"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let mut store = fresh(&dir, low_iterations())?;
+  store.database.io.step = 0;
+  store.database.io.faults.push(io_fault(step, act, n));
+  let mut acked = 0;
+  let mut failed = false;
+  let mut i = 0;
+  while i < 4 && !failed {
+    match do_op(&mut store, i, &first, &second) {
+      Ok(_) => {
+        acked = acked + 1;
+      }
+      Err(UserError.CommitUnknown) => {
+        failed = true;
+      }
+      Err(_) => {
+        return Ok(141);
+      }
+    }
+    i = i + 1;
+  }
+  if failed {
+    if !is_stopped(&store) {
+      return Ok(142);
+    }
+    match lookup_user(&mut store, &name()) {
+      Err(UserError.Stopped) => {}
+      _ => {
+        return Ok(143);
+      }
+    }
+  }
+  let mut again = reopen(store, &dir)?;
+  let mut applied = acked;
+  let mut good = matches_after(&mut again, acked, &first, &second);
+  if !good && failed {
+    applied = acked + 1;
+    good = matches_after(&mut again, applied, &first, &second);
+  }
+  if !good {
+    return Ok(144);
+  }
+  // 一意索引と表が食い違っていない: 行があれば同じ名前は拒否され、無ければ入れられる。
+  let dup = insert_user(&mut again, &name(), &first, 2000);
+  if applied >= 1 {
+    match dup {
+      Err(UserError.UsernameTaken) => {}
+      _ => {
+        return Ok(145);
+      }
+    }
+  } else {
+    if dup.is_err() {
+      return Ok(146);
+    }
+  }
+  close_users(again)?;
+  return Ok(0);
+}
+
+fn interruption_sweep(dir: &String, first: &Bytes, second: &Bytes) -> Result<Int, UserError>
+  intent "4 つの更新の全 I/O の関門を、3 通り（I/O 失敗・クラッシュ・書き込みの途中切れ）で中断して、すべての再起動後の状態を確かめる"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let steps = count_steps(&dir, &first, &second)?;
+  if steps < 8 {
+    return Ok(151);
+  }
+  let mut step = 1;
+  while step <= steps {
+    let io_failure = run_fault(&dir, step, act_fail_io(), 0, &first, &second)?;
+    if io_failure != 0 {
+      return Ok(io_failure);
+    }
+    let crash = run_fault(&dir, step, act_crash(), 0, &first, &second)?;
+    if crash != 0 {
+      return Ok(crash);
+    }
+    let torn = run_fault(&dir, step, act_torn(), 40, &first, &second)?;
+    if torn != 0 {
+      return Ok(torn);
+    }
+    step = step + 1;
+  }
+  return Ok(0);
+}
+
+pub fn main() -> Int
+  intent "中断・復旧の試験をすべて実行し、通れば 0、落ちた試験の番号を返す"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  let dir = "/tmp/sigil_rune_auth_stage_two_recovery";
+  let first = r1();
+  let second = r2();
+  let mut code = restart_keeps_updates(&dir, &first, &second).unwrap_or(100);
+  if code == 0 {
+    code = stopped_after_unknown_commit(&dir, 1, &first, &second).unwrap_or(110);
+  }
+  if code == 0 {
+    code = stopped_after_unknown_commit(&dir, 2, &first, &second).unwrap_or(110);
+  }
+  if code == 0 {
+    code = interruption_sweep(&dir, &first, &second).unwrap_or(150);
+  }
+  remove_tree(&dir);
+  return code;
+}

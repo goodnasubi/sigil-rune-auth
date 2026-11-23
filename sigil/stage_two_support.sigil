@@ -1,0 +1,108 @@
+module stage_two_support
+  targets server
+  trust none
+
+use rune_auth.encode_password;
+use rune_users.UserError;
+use rune_users.UserStore;
+use rune_users.open_users;
+
+// 段 2 の試験の共通部品。反復回数は規則の下限（4096）で試験する（評価器での時間のため）。
+
+pub fn bytes(size: Int, byte: Int) -> Bytes
+  intent "試験用の固定長のバイト列を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < size {
+    out.push(byte);
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn low_iterations() -> Int
+  intent "試験で使う、規則の下限の反復回数"
+  requires none
+  ensures none
+  effects none
+{
+  return 4096;
+}
+
+pub fn secret_of(text: &String) -> Secret
+  intent "試験用のパスワード文字列から Secret を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return Secret.from_bytes(text.as_bytes());
+}
+
+pub fn fixed_record(password: &String, salt_byte: Int, iterations: Int) -> Bytes
+  intent "固定の塩と反復回数でパスワード記録を作る（試験専用。塩は固定でよい）"
+  requires none
+  ensures none
+  effects task.suspend
+{
+  return encode_password(&secret_of(&password), &bytes(16, salt_byte), iterations).unwrap_or(Bytes.new());
+}
+
+pub fn remove_tree(dir: &String)
+  intent "試験ディレクトリの通常ファイルとディレクトリ自体を消す"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut names = List.new();
+  match fs.open_dir(&Path.new(&dir)) {
+    Err(_) => {
+      return;
+    }
+    Ok(d) => {
+      match d.read_entries(64) {
+        Err(_) => {}
+        Ok(entries) => {
+          let mut i = 0;
+          while i < entries.len() {
+            match entries.get(i) {
+              None => {}
+              Some(e) => {
+                names.push(e.name());
+              }
+            }
+            i = i + 1;
+          }
+        }
+      }
+      let _ = d.close();
+    }
+  }
+  let mut k = 0;
+  while k < names.len() {
+    match names.get(k) {
+      None => {}
+      Some(n) => {
+        let mut path = dir.as_bytes();
+        path.push(47);
+        path.extend(&n.as_bytes());
+        let _ = fs.remove_file(&Path.new(&path.to_string_utf8().unwrap_or("")));
+      }
+    }
+    k = k + 1;
+  }
+  let _ = fs.remove_dir(&Path.new(&dir));
+}
+
+pub fn fresh(dir: &String, iterations: Int) -> Result<UserStore, UserError>
+  intent "空のディレクトリで利用者表を開く"
+  requires none
+  ensures none
+  effects fs
+{
+  remove_tree(&dir);
+  return open_users(dir.clone(), iterations);
+}
