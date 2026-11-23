@@ -1,0 +1,576 @@
+module rune_users
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.Tx;
+use db.database.begin_tx;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.error_kind_name;
+use db.relation.ScanOrder;
+use db.relation.column;
+use db.relation.rel_create_index;
+use db.relation.rel_create_table;
+use db.relation.rel_insert;
+use db.relation.rel_replace;
+use db.relation.rel_scan_index;
+use db.relation.rel_table_exists;
+use db.types.Value;
+use db.types.tag_bytes;
+use db.types.tag_int;
+use rune_auth.encode_password;
+use rune_auth.new_user_id;
+
+// ADR 0060 段 2: sigil-db の利用者表。
+//
+// 表 `users(id Bytes 主キー, username Bytes, record Bytes, status Int, generation Int, created Int)` と、
+// `username` の一意索引 `users_username`。1 回の操作は sigil-db 核の直列トランザクション 1 つで行い、
+// 成功は WAL の同期の後にだけ返す。型付き関係 API とトランザクション API だけに依存する。
+// 状態: 0 が有効、1 が無効。世代は 0 から始まり、上がるだけで下がらない。
+// パスワードの記録は rune_auth の版 1（53 バイト）。PBKDF2 は呼び出し側のトランザクションの外で行う。
+
+pub enum UserError {
+  InvalidUsername,
+  InvalidPassword,
+  InvalidIterations,
+  InvalidTime,
+  UsernameTaken,
+  NotFound,
+  EntropyUnavailable,
+  GenerationLimit,
+  Db(String),
+  CommitUnknown,
+  Stopped,
+}
+
+pub struct UserStore {
+  database: Database,
+  stopped: Bool,
+  iterations: Int,
+}
+
+pub struct UserRow {
+  row_user_id: Bytes,
+  row_username: Bytes,
+  row_record: Bytes,
+  row_status: Int,
+  row_generation: Int,
+  row_created: Int,
+}
+
+pub fn table_name() -> String
+  intent "利用者表の名前"
+  requires none
+  ensures none
+  effects none
+{
+  return "users";
+}
+
+pub fn index_name() -> String
+  intent "利用者名の一意索引の名前"
+  requires none
+  ensures none
+  effects none
+{
+  return "users_username";
+}
+
+pub fn status_active() -> Int
+  intent "有効な利用者の状態値"
+  requires none
+  ensures none
+  effects none
+{
+  return 0;
+}
+
+pub fn status_disabled() -> Int
+  intent "無効にした利用者の状態値"
+  requires none
+  ensures none
+  effects none
+{
+  return 1;
+}
+
+pub fn valid_username(username: &Bytes) -> Bool
+  intent "利用者名が 1〜64 バイトで、小文字・数字・ . _ @ - だけか検査する"
+  requires none
+  ensures none
+  effects none
+{
+  if username.byte_len() < 1 || username.byte_len() > 64 {
+    return false;
+  }
+  let mut i = 0;
+  while i < username.byte_len() {
+    let c = username.get(i).unwrap_or(0);
+    if !((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 64 || c == 45) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn map_db_error(store: &mut UserStore, error: &DbError) -> UserError
+  intent "核のエラーを翻訳する。成否不明の確定は店を止め、閉じて開き直すまで操作を受けない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut mapped = UserError.Db(error_kind_name(&error));
+  match error {
+    DbError.CommitUnknown(_) => {
+      store.stopped = true;
+      mapped = UserError.CommitUnknown;
+    }
+    DbError.UniqueViolation(_) => {
+      mapped = UserError.UsernameTaken;
+    }
+    _ => {}
+  }
+  return mapped;
+}
+
+fn abandon(store: &mut UserStore, tx: &mut Tx, error: &DbError) -> UserError
+  intent "失敗した操作のトランザクションを戻して、エラーを翻訳する"
+  requires none
+  ensures none
+  effects none
+{
+  let mapped = map_db_error(&mut store, &error);
+  if !store.stopped {
+    let _ = tx_rollback(&mut tx, &mut store.database);
+  }
+  return mapped;
+}
+
+fn begin(store: &mut UserStore) -> Result<Tx, UserError>
+  intent "1 回の操作の直列トランザクションを始める"
+  requires none
+  ensures none
+  effects fs
+{
+  if store.stopped {
+    return Err(UserError.Stopped);
+  }
+  return match begin_tx(&mut store.database) {
+    Ok(t) => Ok(t),
+    Err(e) => Err(map_db_error(&mut store, &e)),
+  };
+}
+
+fn commit(store: &mut UserStore, tx: &mut Tx) -> Result<Bool, UserError>
+  intent "コミットする。成功は核が WAL を同期した後にだけ返る。成否不明以外の失敗は戻す"
+  requires none
+  ensures none
+  effects fs
+{
+  match tx_commit(&mut tx, &mut store.database) {
+    Ok(_) => {
+      return Ok(true);
+    }
+    Err(e) => {
+      let mapped = map_db_error(&mut store, &e);
+      if !store.stopped {
+        let _ = tx_rollback(&mut tx, &mut store.database);
+      }
+      return Err(mapped);
+    }
+  }
+}
+
+fn ensure_schema(store: &mut UserStore, tx: &mut Tx) -> Result<Bool, UserError>
+  intent "新しいディレクトリのときだけ、利用者表と一意索引を 1 つのトランザクションで作る"
+  requires none
+  ensures none
+  effects fs
+{
+  match rel_table_exists(&store.database, &mut tx, &table_name()) {
+    Ok(found) => {
+      if found {
+        let _ = tx_rollback(&mut tx, &mut store.database);
+        return Ok(true);
+      }
+    }
+    Err(e) => {
+      return Err(abandon(&mut store, &mut tx, &e));
+    }
+  }
+  let mut columns = List.new();
+  columns.push(column("id", tag_bytes()));
+  columns.push(column("username", tag_bytes()));
+  columns.push(column("record", tag_bytes()));
+  columns.push(column("status", tag_int()));
+  columns.push(column("generation", tag_int()));
+  columns.push(column("created", tag_int()));
+  match rel_create_table(&store.database, &mut tx, &table_name(), &columns, &"id") {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(abandon(&mut store, &mut tx, &e));
+    }
+  }
+  match rel_create_index(&store.database, &mut tx, &index_name(), &table_name(), &"username", true) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(abandon(&mut store, &mut tx, &e));
+    }
+  }
+  return commit(&mut store, &mut tx);
+}
+
+pub fn users_db_id() -> Bytes
+  intent "利用者表のデータベース識別子。核は開くたびに保存済みの識別子と照合するので、固定値（ラベルの SHA-256 の先頭 16 バイト）にする"
+  requires none
+  ensures none
+  effects none
+{
+  return sha256(&"sigil-rune-auth/users/v1".as_bytes()).slice(0, 16).unwrap_or(Bytes.new());
+}
+
+pub fn open_users(dir: String, iterations: Int) -> Result<UserStore, UserError>
+  intent "核を開いて排他ロックと復旧を済ませ、新しいディレクトリなら利用者表を作る。iterations は新しい記録の PBKDF2 の反復回数"
+  requires none
+  ensures none
+  effects fs
+{
+  if iterations < 4096 || iterations > 100000 {
+    return Err(UserError.InvalidIterations);
+  }
+  let opened = match open_database(dir, users_db_id()) {
+    Ok(d) => Ok(d),
+    Err(e) => Err(UserError.Db(error_kind_name(&e))),
+  };
+  let mut store = UserStore { database: opened?, stopped: false, iterations: iterations };
+  let mut tx = begin(&mut store)?;
+  ensure_schema(&mut store, &mut tx)?;
+  return Ok(store);
+}
+
+pub fn close_users(store: UserStore) -> Result<Bool, UserError>
+  intent "核の排他ロックを手放す"
+  requires none
+  ensures none
+  effects fs
+{
+  match close_database(store.database) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(UserError.Db(error_kind_name(&e)));
+    }
+  }
+  return Ok(true);
+}
+
+pub fn is_stopped(store: &UserStore) -> Bool
+  intent "コミットの成否が不明になった後か。閉じて開き直すことだけが復旧になる"
+  requires none
+  ensures none
+  effects none
+{
+  return store.stopped;
+}
+
+fn byte_column(row: &List<Value>, index: Int) -> Bytes
+  intent "行のバイト列の列を読む"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(index) {
+    Some(Value.BytesVal(b)) => b.clone(),
+    _ => Bytes.new(),
+  };
+}
+
+fn int_column(row: &List<Value>, index: Int) -> Int
+  intent "行の整数の列を読む"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(index) {
+    Some(Value.IntVal(n)) => n + 0,
+    _ => -1,
+  };
+}
+
+fn to_user_row(row: &List<Value>) -> UserRow
+  intent "保存された行を UserRow にする"
+  requires none
+  ensures none
+  effects none
+{
+  return UserRow { row_user_id: byte_column(&row, 0), row_username: byte_column(&row, 1), row_record: byte_column(&row, 2), row_status: int_column(&row, 3), row_generation: int_column(&row, 4), row_created: int_column(&row, 5) };
+}
+
+fn full_row(user_id: &Bytes, username: &Bytes, record: &Bytes, status: Int, generation: Int, created: Int) -> List<Value>
+  intent "表の列の順に並べた行を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.BytesVal(user_id.clone()));
+  row.push(Value.BytesVal(username.clone()));
+  row.push(Value.BytesVal(record.clone()));
+  row.push(Value.IntVal(status));
+  row.push(Value.IntVal(generation));
+  row.push(Value.IntVal(created));
+  return row;
+}
+
+fn abandon_not_found(store: &mut UserStore, tx: &mut Tx) -> UserError
+  intent "行が無かった操作のトランザクションを戻す"
+  requires none
+  ensures none
+  effects none
+{
+  let _ = tx_rollback(&mut tx, &mut store.database);
+  return UserError.NotFound;
+}
+
+fn find_row(store: &mut UserStore, tx: &mut Tx, username: &Bytes) -> Result<Option<UserRow>, UserError>
+  intent "一意索引で利用者名の行を探す。書式が不正な名前は無い扱いにする"
+  requires none
+  ensures none
+  effects fs
+{
+  if !valid_username(&username) {
+    return Ok(None);
+  }
+  let bound = Some(Value.BytesVal(username.clone()));
+  let scanned = match rel_scan_index(&store.database, &mut tx, &index_name(), &bound, &bound, &ScanOrder.Asc, 2) {
+    Ok(rows) => Ok(rows),
+    Err(e) => Err(abandon(&mut store, &mut tx, &e)),
+  };
+  let rows = scanned?;
+  return match rows.get(0) {
+    Some(row) => Ok(Some(to_user_row(&row))),
+    None => Ok(None),
+  };
+}
+
+pub fn lookup_user(store: &mut UserStore, username: &Bytes) -> Result<Option<UserRow>, UserError>
+  intent "利用者名で行を引く。書き込みはしない"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin(&mut store)?;
+  let found = find_row(&mut store, &mut tx, &username)?;
+  let _ = tx_rollback(&mut tx, &mut store.database);
+  return Ok(found);
+}
+
+fn fresh_record(password: &Secret, iterations: Int) -> Result<Bytes, UserError>
+  intent "新しい塩でパスワードの記録を作る。トランザクションの外で呼ぶ"
+  requires none
+  ensures none
+  effects random, task.suspend
+{
+  return match random.bytes(16) {
+    None => Err(UserError.EntropyUnavailable),
+    Some(salt) => match encode_password(&password, &salt, iterations) {
+      None => Err(UserError.InvalidPassword),
+      Some(record) => Ok(record),
+    },
+  };
+}
+
+pub fn new_record(store: &UserStore, password: &Secret) -> Result<Bytes, UserError>
+  intent "店の反復回数と新しい塩でパスワードの記録を作る"
+  requires none
+  ensures none
+  effects random, task.suspend
+{
+  return fresh_record(&password, store.iterations);
+}
+
+pub fn insert_user(store: &mut UserStore, username: &Bytes, record: &Bytes, now: Int) -> Result<Bytes, UserError>
+  intent "作成済みのパスワード記録で利用者を 1 つのトランザクションで登録し、新しい利用者 ID を返す。同じ名前は拒否する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  if !valid_username(&username) {
+    return Err(UserError.InvalidUsername);
+  }
+  if now < 0 {
+    return Err(UserError.InvalidTime);
+  }
+  if record.byte_len() != 53 || record.get(0).unwrap_or(0) != 1 {
+    return Err(UserError.InvalidPassword);
+  }
+  let generated = new_user_id();
+  if generated.is_none() {
+    return Err(UserError.EntropyUnavailable);
+  }
+  let user_id = generated.unwrap_or(Bytes.new());
+  let mut tx = begin(&mut store)?;
+  if find_row(&mut store, &mut tx, &username)?.is_some() {
+    let _ = tx_rollback(&mut tx, &mut store.database);
+    return Err(UserError.UsernameTaken);
+  }
+  let row = full_row(&user_id, &username, &record, status_active(), 0, now);
+  match rel_insert(&store.database, &mut tx, &table_name(), &row) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(abandon(&mut store, &mut tx, &e));
+    }
+  }
+  commit(&mut store, &mut tx)?;
+  return Ok(user_id);
+}
+
+pub fn register_user(store: &mut UserStore, username: &Bytes, password: &Secret, now: Int) -> Result<Bytes, UserError>
+  intent "利用者を登録し、新しい利用者 ID を返す。同じ名前は、PBKDF2 の前に（そして登録のトランザクションの中でも）拒否する"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  if !valid_username(&username) {
+    return Err(UserError.InvalidUsername);
+  }
+  if lookup_user(&mut store, &username)?.is_some() {
+    return Err(UserError.UsernameTaken);
+  }
+  let record = fresh_record(&password, store.iterations)?;
+  return insert_user(&mut store, &username, &record, now);
+}
+
+fn rewrite(store: &mut UserStore, tx: &mut Tx, row: &UserRow, record: &Bytes, status: Int, generation: Int) -> Result<Bool, UserError>
+  intent "利用者の行を、作成時刻を保ったまま置き換える"
+  requires none
+  ensures none
+  effects fs
+{
+  let updated = full_row(&row.row_user_id, &row.row_username, &record, status, generation, row.row_created);
+  match rel_replace(&store.database, &mut tx, &table_name(), &updated) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(abandon(&mut store, &mut tx, &e));
+    }
+  }
+  return Ok(true);
+}
+
+fn next_generation(store: &mut UserStore, tx: &mut Tx, row: &UserRow) -> Result<Int, UserError>
+  intent "世代を 1 上げた値を返す。Int の上限では上げない"
+  requires none
+  ensures none
+  effects none
+{
+  if row.row_generation < 0 || row.row_generation >= 9223372036854775807 {
+    let _ = tx_rollback(&mut tx, &mut store.database);
+    return Err(UserError.GenerationLimit);
+  }
+  return Ok(row.row_generation + 1);
+}
+
+fn require_row(store: &mut UserStore, tx: &mut Tx, username: &Bytes) -> Result<UserRow, UserError>
+  intent "利用者名の行を引く。無ければ戻して NotFound にする"
+  requires none
+  ensures none
+  effects fs
+{
+  return match find_row(&mut store, &mut tx, &username)? {
+    Some(row) => Ok(row),
+    None => Err(abandon_not_found(&mut store, &mut tx)),
+  };
+}
+
+pub fn disable_user(store: &mut UserStore, username: &Bytes) -> Result<Bool, UserError>
+  intent "利用者を無効にする。すでに無効なら何も変えずに成功する。世代と記録は変えない"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin(&mut store)?;
+  let row = require_row(&mut store, &mut tx, &username)?;
+  if row.row_status == status_disabled() {
+    let _ = tx_rollback(&mut tx, &mut store.database);
+    return Ok(true);
+  }
+  rewrite(&mut store, &mut tx, &row, &row.row_record, status_disabled(), row.row_generation)?;
+  commit(&mut store, &mut tx)?;
+  return Ok(true);
+}
+
+pub fn bump_generation(store: &mut UserStore, username: &Bytes) -> Result<Int, UserError>
+  intent "利用者の世代を 1 上げ、新しい世代を返す。その利用者の既存のセッションが失効する根拠になる"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin(&mut store)?;
+  let row = require_row(&mut store, &mut tx, &username)?;
+  let generation = next_generation(&mut store, &mut tx, &row)?;
+  rewrite(&mut store, &mut tx, &row, &row.row_record, row.row_status, generation)?;
+  commit(&mut store, &mut tx)?;
+  return Ok(generation);
+}
+
+pub fn replace_password(store: &mut UserStore, username: &Bytes, record: &Bytes) -> Result<Int, UserError>
+  intent "作成済みの記録で置き換え、同じトランザクションで世代を 1 上げて新しい世代を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  if !valid_username(&username) {
+    return Err(UserError.InvalidUsername);
+  }
+  if record.byte_len() != 53 || record.get(0).unwrap_or(0) != 1 {
+    return Err(UserError.InvalidPassword);
+  }
+  let mut tx = begin(&mut store)?;
+  let row = require_row(&mut store, &mut tx, &username)?;
+  let generation = next_generation(&mut store, &mut tx, &row)?;
+  rewrite(&mut store, &mut tx, &row, &record, row.row_status, generation)?;
+  commit(&mut store, &mut tx)?;
+  return Ok(generation);
+}
+
+pub fn set_password(store: &mut UserStore, username: &Bytes, password: &Secret) -> Result<Int, UserError>
+  intent "パスワードの記録を新しい塩で置き換え、同じトランザクションで世代を 1 上げて新しい世代を返す"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  if !valid_username(&username) {
+    return Err(UserError.InvalidUsername);
+  }
+  let record = fresh_record(&password, store.iterations)?;
+  return replace_password(&mut store, &username, &record);
+}
+
+pub fn upgrade_record(store: &mut UserStore, username: &Bytes, old_record: &Bytes, new_record: &Bytes) -> Result<Bool, UserError>
+  intent "保存中の記録が old_record のままのときだけ new_record に置き換える（世代・状態は変えない）。違えば何もせず false"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin(&mut store)?;
+  let found = find_row(&mut store, &mut tx, &username)?;
+  match found {
+    None => {
+      let _ = tx_rollback(&mut tx, &mut store.database);
+      return Ok(false);
+    }
+    Some(row) => {
+      if row.row_record != old_record.clone() {
+        let _ = tx_rollback(&mut tx, &mut store.database);
+        return Ok(false);
+      }
+      rewrite(&mut store, &mut tx, &row, &new_record, row.row_status, row.row_generation)?;
+    }
+  }
+  commit(&mut store, &mut tx)?;
+  return Ok(true);
+}

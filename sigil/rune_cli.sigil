@@ -1,0 +1,223 @@
+module rune_cli
+  targets server
+  trust none
+
+use rune_auth.user_subject;
+use rune_users.UserError;
+use rune_users.UserStore;
+use rune_users.bump_generation;
+use rune_users.close_users;
+use rune_users.disable_user;
+use rune_users.open_users;
+use rune_users.register_user;
+use rune_users.set_password;
+
+// ADR 0060 段 2: 利用者管理の CLI（登録・無効化・世代を上げる・パスワード設定）。サービスを止めて、同じディレクトリに対して行う。
+//
+//   rune_cli <コマンド> --dir=<DB ディレクトリ> --user=<利用者名>
+// `--raw-argv` でビルド・実行する（引数は `env.args()` から読む）。
+//
+// コマンド: register（登録。標準出力に利用者の主体表記 u＋hex を出す）、disable（無効化）、
+//           bump-generation（世代を上げる。新しい世代を出す）、set-password（パスワードの置き換え。世代も上がる）。
+// パスワードは引数に載せず、環境変数 RUNE_AUTH_PASSWORD から読む（register と set-password のとき）。
+// 出力と終了コード:
+//   0 成功／1 内部の失敗（ディスク、核、乱数、時計）／2 使い方（引数・環境変数）／3 利用者がいない／4 同じ利用者名が既にある／5 利用者名またはパスワードが規則に合わない
+// パスワード・記録・鍵は出力しない。出力は固定の文だけ。
+
+fn arg_value(args: &List<String>, prefix: &String) -> Option<String>
+  intent "--名前=値 の形の引数から値を取り出す。最初の一致だけを採る"
+  requires none
+  ensures none
+  effects none
+{
+  let want = prefix.as_bytes();
+  let mut i = 0;
+  while i < args.len() {
+    match args.get(i) {
+      None => {}
+      Some(arg) => {
+        let b = arg.as_bytes();
+        if b.byte_len() >= want.byte_len() && b.slice(0, want.byte_len()).unwrap_or(Bytes.new()) == want {
+          let rest = b.slice(want.byte_len(), b.byte_len()).unwrap_or(Bytes.new());
+          return Some(rest.to_string_utf8().unwrap_or(""));
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn decimal(n: Int) -> String
+  intent "非負の整数を 10 進数の文字列にする"
+  requires none
+  ensures none
+  effects none
+{
+  if n <= 0 {
+    return "0";
+  }
+  let mut digits = Bytes.new();
+  let mut rest = n;
+  while rest > 0 {
+    digits.push(48 + rest % 10);
+    rest = rest / 10;
+  }
+  let mut text = Bytes.new();
+  let mut i = digits.byte_len();
+  while i > 0 {
+    i = i - 1;
+    text.push(digits.get(i).unwrap_or(48));
+  }
+  return text.to_string_utf8().unwrap_or("0");
+}
+
+fn fail(message: &String, code: Int) -> Int
+  intent "固定の文を標準出力に書いて終了コードを返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&message);
+  return code;
+}
+
+fn error_code(error: &UserError) -> Int
+  intent "利用者表のエラーを CLI の終了コードにし、固定の文を書く"
+  requires none
+  ensures none
+  effects console
+{
+  return match error {
+    UserError.NotFound => fail(&"利用者がいません", 3),
+    UserError.UsernameTaken => fail(&"同じ利用者名が既にあります", 4),
+    UserError.InvalidUsername => fail(&"利用者名は 1〜64 バイトの小文字・数字・. _ @ - だけです", 5),
+    UserError.InvalidPassword => fail(&"パスワードは 12〜256 バイトにしてください", 5),
+    _ => fail(&"内部の失敗です", 1),
+  };
+}
+
+fn dispatch(store: &mut UserStore, command: &String, username: &Bytes, password: &Secret, now: Int) -> Int
+  intent "開いた利用者表に対してコマンドを 1 つ実行し、終了コードを返す"
+  requires none
+  ensures none
+  effects console, fs, random, task.suspend
+{
+  let mut code = 2;
+  if command == "register" {
+    match register_user(&mut store, &username, &password, now) {
+      Ok(user_id) => {
+        console.log(&user_subject(&user_id).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or(""));
+        code = 0;
+      }
+      Err(e) => {
+        code = error_code(&e);
+      }
+    }
+  } else if command == "disable" {
+    match disable_user(&mut store, &username) {
+      Ok(_) => {
+        console.log(&"無効にしました");
+        code = 0;
+      }
+      Err(e) => {
+        code = error_code(&e);
+      }
+    }
+  } else if command == "bump-generation" {
+    match bump_generation(&mut store, &username) {
+      Ok(generation) => {
+        console.log(&decimal(generation));
+        code = 0;
+      }
+      Err(e) => {
+        code = error_code(&e);
+      }
+    }
+  } else if command == "set-password" {
+    match set_password(&mut store, &username, &password) {
+      Ok(generation) => {
+        console.log(&decimal(generation));
+        code = 0;
+      }
+      Err(e) => {
+        code = error_code(&e);
+      }
+    }
+  } else {
+    code = fail(&"コマンドは register・disable・bump-generation・set-password のいずれかです", 2);
+  }
+  return code;
+}
+
+pub fn execute(command: &String, dir: &String, username: &Bytes, password: &Secret, now: Int, iterations: Int) -> Int
+  intent "利用者表を開き、コマンドを 1 つ実行して閉じる。password は register と set-password だけが使う。iterations は新しい記録の反復回数（CLI の main は 100000）"
+  requires none
+  ensures none
+  effects console, fs, random, task.suspend
+{
+  match open_users(dir.clone(), iterations) {
+    Err(_) => {
+      return fail(&"利用者表を開けません（別のプロセスが使用中、または破損）", 1);
+    }
+    Ok(opened) => {
+      let mut store = opened;
+      let mut code = dispatch(&mut store, &command, &username, &password, now);
+      match close_users(store) {
+        Ok(_) => {}
+        Err(_) => {
+          if code == 0 {
+            code = fail(&"内部の失敗です", 1);
+          }
+        }
+      }
+      return code;
+    }
+  }
+}
+
+fn run() -> Int
+  intent "引数と環境変数を読んでコマンドを実行し、終了コードを返す。引数・環境変数が不正なら何も開かない"
+  requires none
+  ensures none
+  effects clock, console, env, fs, random, task.suspend
+{
+  let args = env.args();
+  let command = match args.get(0) {
+    Some(c) => c.clone(),
+    None => "",
+  };
+  let dir = arg_value(&args, &"--dir=");
+  let user = arg_value(&args, &"--user=");
+  if dir.is_none() || user.is_none() {
+    return fail(&"使い方: rune_cli <コマンド> --dir=<DB ディレクトリ> --user=<利用者名>", 2);
+  }
+  let needs_password = command == "register" || command == "set-password";
+  let mut secret = Secret.from_bytes(Bytes.new());
+  if needs_password {
+    match env.get(&"RUNE_AUTH_PASSWORD") {
+      None => {
+        return fail(&"環境変数 RUNE_AUTH_PASSWORD にパスワードを設定してください", 2);
+      }
+      Some(text) => {
+        secret = Secret.from_bytes(text.as_bytes());
+      }
+    }
+  }
+  let now = clock.unix_seconds();
+  if now.is_none() {
+    return fail(&"内部の失敗です", 1);
+  }
+  return execute(&command, &dir.unwrap_or(""), &user.unwrap_or("").as_bytes(), &secret, now.unwrap_or(0), 100000);
+}
+
+pub fn main() -> Int
+  intent "コマンドを実行し、結果を終了コードにして終わる（戻り値は表示させない）"
+  requires none
+  ensures none
+  effects clock, console, env, fs, process, random, task.suspend
+{
+  let code = run();
+  process.exit(code);
+  return code;
+}

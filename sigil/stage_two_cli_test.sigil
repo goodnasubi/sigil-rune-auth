@@ -1,0 +1,141 @@
+module stage_two_cli_test
+  targets server
+  trust none
+
+use rune_auth.verify_password;
+use rune_cli.execute;
+use rune_users.UserError;
+use rune_users.UserRow;
+use rune_users.close_users;
+use rune_users.lookup_user;
+use rune_users.open_users;
+use rune_users.status_active;
+use rune_users.status_disabled;
+use stage_two_support.low_iterations;
+use stage_two_support.remove_tree;
+use stage_two_support.secret_of;
+
+// ADR 0060 段 2: 利用者管理 CLI の `execute` の試験（終了コードと、表への反映）。反復回数は規則の下限（4096）。
+// 実際の実行ファイルの引数の読み方と終了コードは scripts/check.sh の煙試験で確かめる。
+
+fn run(command: &String, dir: &String, user: &String, password: &String) -> Int
+  intent "CLI のコマンドを 1 つ実行して終了コードを返す"
+  requires none
+  ensures none
+  effects console, fs, random, task.suspend
+{
+  return execute(&command, &dir, &user.as_bytes(), &secret_of(&password), 5000, low_iterations());
+}
+
+fn row_of(dir: &String, user: &String) -> Result<Option<UserRow>, UserError>
+  intent "CLI が閉じた後のディレクトリを開いて、利用者の行を読む"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = open_users(dir.clone(), low_iterations())?;
+  let found = lookup_user(&mut store, &user.as_bytes());
+  close_users(store)?;
+  return found;
+}
+
+fn commands(dir: &String) -> Result<Int, UserError>
+  intent "登録・無効化・世代・パスワード置き換えの結果と終了コードを確かめる"
+  requires none
+  ensures none
+  effects console, fs, random, task.suspend
+{
+  remove_tree(&dir);
+  if run(&"register", &dir, &"alice", &"alice-password-1") != 0 {
+    return Ok(1);
+  }
+  match row_of(&dir, &"alice")? {
+    None => {
+      return Ok(2);
+    }
+    Some(row) => {
+      if row.row_generation != 0 || row.row_status != status_active() || row.row_created != 5000 {
+        return Ok(3);
+      }
+    }
+  }
+  if run(&"register", &dir, &"alice", &"alice-password-1") != 4 {
+    return Ok(4);
+  }
+  if run(&"register", &dir, &"Bad Name", &"alice-password-1") != 5 {
+    return Ok(5);
+  }
+  if run(&"register", &dir, &"carol", &"short") != 5 {
+    return Ok(6);
+  }
+  if row_of(&dir, &"carol")?.is_some() {
+    return Ok(7);
+  }
+  if run(&"bump-generation", &dir, &"alice", &"") != 0 {
+    return Ok(8);
+  }
+  if run(&"set-password", &dir, &"alice", &"alice-password-2") != 0 {
+    return Ok(9);
+  }
+  match row_of(&dir, &"alice")? {
+    None => {
+      return Ok(10);
+    }
+    Some(row) => {
+      if row.row_generation != 2 || !verify_password(&secret_of(&"alice-password-2"), &row.row_record) {
+        return Ok(11);
+      }
+    }
+  }
+  if run(&"disable", &dir, &"alice", &"") != 0 {
+    return Ok(12);
+  }
+  match row_of(&dir, &"alice")? {
+    None => {
+      return Ok(13);
+    }
+    Some(row) => {
+      if row.row_status != status_disabled() || row.row_generation != 2 {
+        return Ok(14);
+      }
+    }
+  }
+  if run(&"disable", &dir, &"ghost", &"") != 3 || run(&"bump-generation", &dir, &"ghost", &"") != 3 || run(&"set-password", &dir, &"ghost", &"ghost-password-1") != 3 {
+    return Ok(15);
+  }
+  if run(&"unknown-command", &dir, &"alice", &"") != 2 {
+    return Ok(16);
+  }
+  return Ok(0);
+}
+
+fn busy_directory(dir: &String) -> Result<Int, UserError>
+  intent "別のプロセスが（同じプロセス内の別の開き方でも）排他ロックを持つ間は、何も変えず 1 で終わる"
+  requires none
+  ensures none
+  effects console, fs, random, task.suspend
+{
+  remove_tree(&dir);
+  let mut holder = open_users(dir.clone(), low_iterations())?;
+  let code = run(&"disable", &dir, &"alice", &"");
+  close_users(holder)?;
+  if code != 1 {
+    return Ok(21);
+  }
+  return Ok(0);
+}
+
+pub fn main() -> Int
+  intent "CLI の試験を実行し、通れば 0、落ちた試験の番号を返す"
+  requires none
+  ensures none
+  effects console, fs, random, task.suspend
+{
+  let dir = "/tmp/sigil_rune_auth_stage_two_cli";
+  let mut code = commands(&dir).unwrap_or(90);
+  if code == 0 {
+    code = busy_directory(&dir).unwrap_or(95);
+  }
+  remove_tree(&dir);
+  return code;
+}

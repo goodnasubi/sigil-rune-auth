@@ -1,0 +1,432 @@
+module stage_two_users_test
+  targets server
+  trust none
+
+use rune_auth.verify_password;
+use rune_login.LoginGate;
+use rune_login.LoginOutcome;
+use rune_login.login;
+use rune_login.new_login_gate;
+use rune_throttle.new_throttle;
+use rune_users.UserError;
+use rune_users.UserRow;
+use rune_users.UserStore;
+use rune_users.bump_generation;
+use rune_users.close_users;
+use rune_users.disable_user;
+use rune_users.insert_user;
+use rune_users.lookup_user;
+use rune_users.open_users;
+use rune_users.register_user;
+use rune_users.replace_password;
+use rune_users.set_password;
+use rune_users.status_active;
+use rune_users.status_disabled;
+use rune_users.upgrade_record;
+use stage_two_support.bytes;
+use stage_two_support.fixed_record;
+use stage_two_support.fresh;
+use stage_two_support.low_iterations;
+use stage_two_support.remove_tree;
+use stage_two_support.secret_of;
+
+// ADR 0060 段 2: 利用者表・ログイン照合・抑制・再計算による移行の試験。
+// PBKDF2 は評価器で遅いので、反復回数は規則の下限（4096）にし、呼ぶ回数を絞る。
+
+fn name(text: &String) -> Bytes
+  intent "利用者名のバイト列"
+  requires none
+  ensures none
+  effects none
+{
+  return text.as_bytes();
+}
+
+pub struct Seen {
+  kind: Int,
+  retry: Int,
+  generation: Int,
+  user_id: Bytes,
+}
+
+fn attempt(store: &mut UserStore, gate: &mut LoginGate, user: &String, password: &String, now: Int) -> Seen
+  intent "ログインを 1 回試し、結果を平らにする。kind は -1 が内部エラー、0 が失敗、1 が成功、2 が拒否中"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  return match login(&mut store, &mut gate, &name(&user), &secret_of(&password), now) {
+    Ok(LoginOutcome.Success(id, generation)) => Seen { kind: 1, retry: 0, generation: generation, user_id: id },
+    Ok(LoginOutcome.Failed) => Seen { kind: 0, retry: 0, generation: 0, user_id: Bytes.new() },
+    Ok(LoginOutcome.Throttled(wait)) => Seen { kind: 2, retry: wait, generation: 0, user_id: Bytes.new() },
+    Err(_) => Seen { kind: -1, retry: 0, generation: 0, user_id: Bytes.new() },
+  };
+}
+
+fn row_of(store: &mut UserStore, user: &String) -> Option<UserRow>
+  intent "利用者の行を引く。エラーは無い扱い"
+  requires none
+  ensures none
+  effects fs
+{
+  return match lookup_user(&mut store, &name(&user)) {
+    Ok(found) => found,
+    Err(_) => None,
+  };
+}
+
+fn iterations_of(record: &Bytes) -> Int
+  intent "版 1 の記録の反復回数を独立に読む"
+  requires none
+  ensures none
+  effects none
+{
+  return record.get(1).unwrap_or(0) * 16777216 + record.get(2).unwrap_or(0) * 65536 + record.get(3).unwrap_or(0) * 256 + record.get(4).unwrap_or(0);
+}
+
+fn is_taken(outcome: &Result<Bytes, UserError>) -> Bool
+  intent "同じ利用者名の拒否か"
+  requires none
+  ensures none
+  effects none
+{
+  return match outcome {
+    Err(UserError.UsernameTaken) => true,
+    _ => false,
+  };
+}
+
+fn registration_rules(dir: &String) -> Result<Int, UserError>
+  intent "登録・一意性・書式の拒否・再起動後の保持・排他ロックを確かめる"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  let mut store = fresh(&dir, low_iterations())?;
+  let alice = register_user(&mut store, &name(&"alice"), &secret_of(&"alice-password-1"), 1000)?;
+  if alice.byte_len() != 16 {
+    return Ok(101);
+  }
+  match row_of(&mut store, &"alice") {
+    None => {
+      return Ok(102);
+    }
+    Some(row) => {
+      if row.row_user_id != alice || row.row_generation != 0 || row.row_status != status_active() || row.row_record.byte_len() != 53 || row.row_record.get(0).unwrap_or(0) != 1 || iterations_of(&row.row_record) != 4096 || row.row_created != 1000 {
+        return Ok(103);
+      }
+      if !verify_password(&secret_of(&"alice-password-1"), &row.row_record) {
+        return Ok(104);
+      }
+    }
+  }
+  // 同じ名前は PBKDF2 の前に拒否され、登録のトランザクションの中でも拒否される。
+  if !is_taken(&register_user(&mut store, &name(&"alice"), &secret_of(&"another-password-9"), 1001)) {
+    return Ok(105);
+  }
+  let bob_record = fixed_record(&"bob-password-123", 1, 4096);
+  if !is_taken(&insert_user(&mut store, &name(&"alice"), &bob_record, 1002)) {
+    return Ok(106);
+  }
+  insert_user(&mut store, &name(&"bob"), &bob_record, 1003)?;
+  // 書式の拒否: 空、大文字、空白、65 バイト。パスワードの長さの規則。
+  match register_user(&mut store, &name(&""), &secret_of(&"valid-password-1"), 1004) {
+    Err(UserError.InvalidUsername) => {}
+    _ => {
+      return Ok(107);
+    }
+  }
+  match register_user(&mut store, &name(&"Alice"), &secret_of(&"valid-password-1"), 1004) {
+    Err(UserError.InvalidUsername) => {}
+    _ => {
+      return Ok(108);
+    }
+  }
+  match register_user(&mut store, &name(&"a b"), &secret_of(&"valid-password-1"), 1004) {
+    Err(UserError.InvalidUsername) => {}
+    _ => {
+      return Ok(109);
+    }
+  }
+  match register_user(&mut store, &bytes(65, 97), &secret_of(&"valid-password-1"), 1004) {
+    Err(UserError.InvalidUsername) => {}
+    _ => {
+      return Ok(110);
+    }
+  }
+  match register_user(&mut store, &name(&"carol"), &secret_of(&"short"), 1004) {
+    Err(UserError.InvalidPassword) => {}
+    _ => {
+      return Ok(111);
+    }
+  }
+  if row_of(&mut store, &"carol").is_some() {
+    return Ok(112);
+  }
+  if register_user(&mut store, &bytes(64, 97), &secret_of(&"valid-password-2"), 1005).is_err() {
+    return Ok(113);
+  }
+  // 再起動しても行が保たれる。排他ロックは 2 つ目の open を拒否する。
+  close_users(store)?;
+  let mut again = open_users(dir.clone(), low_iterations())?;
+  match row_of(&mut again, &"alice") {
+    None => {
+      return Ok(114);
+    }
+    Some(row) => {
+      if row.row_user_id != alice || row.row_generation != 0 {
+        return Ok(115);
+      }
+    }
+  }
+  if open_users(dir.clone(), low_iterations()).is_ok() {
+    return Ok(116);
+  }
+  close_users(again)?;
+  return Ok(0);
+}
+
+fn login_is_uniform(dir: &String) -> Result<Int, UserError>
+  intent "未知・書式不正・無効・誤パスワードは同じ Failed になり、正しい組だけが成功する"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  let mut store = fresh(&dir, low_iterations())?;
+  let alice = register_user(&mut store, &name(&"alice"), &secret_of(&"alice-password-1"), 1000)?;
+  insert_user(&mut store, &name(&"bob"), &fixed_record(&"bob-password-123", 1, 4096), 1000)?;
+  let mut gate = new_login_gate(&store, new_throttle())?;
+  let ok = attempt(&mut store, &mut gate, &"alice", &"alice-password-1", 2000);
+  if ok.kind != 1 || ok.user_id != alice || ok.generation != 0 {
+    return Ok(201);
+  }
+  if attempt(&mut store, &mut gate, &"alice", &"alice-password-2", 2001).kind != 0 {
+    return Ok(202);
+  }
+  if attempt(&mut store, &mut gate, &"ghost", &"alice-password-1", 2002).kind != 0 {
+    return Ok(203);
+  }
+  if attempt(&mut store, &mut gate, &"Bad Name", &"alice-password-1", 2003).kind != 0 {
+    return Ok(204);
+  }
+  // 規則に合わない長さのパスワードは PBKDF2 を行わずに Failed。
+  if attempt(&mut store, &mut gate, &"alice", &"short", 2004).kind != 0 {
+    return Ok(205);
+  }
+  if attempt(&mut store, &mut gate, &"bob", &"bob-password-123", 2005).kind != 1 {
+    return Ok(206);
+  }
+  disable_user(&mut store, &name(&"bob"))?;
+  disable_user(&mut store, &name(&"bob"))?;
+  if attempt(&mut store, &mut gate, &"bob", &"bob-password-123", 2006).kind != 0 {
+    return Ok(207);
+  }
+  match row_of(&mut store, &"bob") {
+    None => {
+      return Ok(208);
+    }
+    Some(row) => {
+      if row.row_status != status_disabled() || row.row_generation != 0 {
+        return Ok(209);
+      }
+    }
+  }
+  close_users(store)?;
+  return Ok(0);
+}
+
+fn throttle_in_login(dir: &String) -> Result<Int, UserError>
+  intent "5 回の失敗で拒否に入り、正しいパスワードでも拒否中は通らない。未知の利用者も同じ規則。解けた秒の正しい組は成功する"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  let mut store = fresh(&dir, low_iterations())?;
+  insert_user(&mut store, &name(&"alice"), &fixed_record(&"alice-password-1", 2, 4096), 1000)?;
+  let mut gate = new_login_gate(&store, new_throttle())?;
+  let mut i = 0;
+  while i < 5 {
+    if attempt(&mut store, &mut gate, &"alice", &"wrong-password-0", 100 + i).kind != 0 {
+      return Ok(301);
+    }
+    i = i + 1;
+  }
+  // 5 回目の失敗は時刻 104。拒否は 1004 まで。
+  let early = attempt(&mut store, &mut gate, &"alice", &"alice-password-1", 105);
+  if early.kind != 2 || early.retry != 899 {
+    return Ok(302);
+  }
+  let last = attempt(&mut store, &mut gate, &"alice", &"alice-password-1", 1003);
+  if last.kind != 2 || last.retry != 1 {
+    return Ok(303);
+  }
+  let freed = attempt(&mut store, &mut gate, &"alice", &"alice-password-1", 1004);
+  if freed.kind != 1 {
+    return Ok(304);
+  }
+  // 存在しない利用者名も、同じ回数で同じ長さの拒否に入る。
+  let mut j = 0;
+  while j < 5 {
+    if attempt(&mut store, &mut gate, &"ghost", &"wrong-password-0", 2000 + j).kind != 0 {
+      return Ok(305);
+    }
+    j = j + 1;
+  }
+  let ghost = attempt(&mut store, &mut gate, &"ghost", &"wrong-password-0", 2005);
+  if ghost.kind != 2 || ghost.retry != 899 {
+    return Ok(306);
+  }
+  close_users(store)?;
+  return Ok(0);
+}
+
+fn generation_and_password(dir: &String) -> Result<Int, UserError>
+  intent "世代の引き上げとパスワードの置き換え（世代も上がる）がログインに反映される。存在しない利用者は NotFound"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  let mut store = fresh(&dir, low_iterations())?;
+  insert_user(&mut store, &name(&"alice"), &fixed_record(&"alice-password-1", 2, 4096), 1000)?;
+  let mut gate = new_login_gate(&store, new_throttle())?;
+  if bump_generation(&mut store, &name(&"alice"))? != 1 {
+    return Ok(401);
+  }
+  let first = attempt(&mut store, &mut gate, &"alice", &"alice-password-1", 3000);
+  if first.kind != 1 || first.generation != 1 {
+    return Ok(402);
+  }
+  if set_password(&mut store, &name(&"alice"), &secret_of(&"alice-password-2"))? != 2 {
+    return Ok(403);
+  }
+  if attempt(&mut store, &mut gate, &"alice", &"alice-password-1", 3001).kind != 0 {
+    return Ok(404);
+  }
+  let second = attempt(&mut store, &mut gate, &"alice", &"alice-password-2", 3002);
+  if second.kind != 1 || second.generation != 2 || second.user_id != first.user_id {
+    return Ok(405);
+  }
+  let spare = fixed_record(&"spare-password-12", 3, 4096);
+  match bump_generation(&mut store, &name(&"nobody")) {
+    Err(UserError.NotFound) => {}
+    _ => {
+      return Ok(406);
+    }
+  }
+  match replace_password(&mut store, &name(&"nobody"), &spare) {
+    Err(UserError.NotFound) => {}
+    _ => {
+      return Ok(407);
+    }
+  }
+  match disable_user(&mut store, &name(&"nobody")) {
+    Err(UserError.NotFound) => {}
+    _ => {
+      return Ok(408);
+    }
+  }
+  // 記録の形式が違う置き換えは拒否される。
+  match replace_password(&mut store, &name(&"alice"), &bytes(10, 1)) {
+    Err(UserError.InvalidPassword) => {}
+    _ => {
+      return Ok(409);
+    }
+  }
+  close_users(store)?;
+  return Ok(0);
+}
+
+fn migration(dir: &String) -> Result<Int, UserError>
+  intent "反復回数の少ない記録は、正しいパスワードのログインでだけ新しい設定の記録に置き換わる"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  let mut store = fresh(&dir, 5000)?;
+  let stale = fixed_record(&"carol-password-1", 4, 4096);
+  insert_user(&mut store, &name(&"carol"), &stale, 1000)?;
+  let mut gate = new_login_gate(&store, new_throttle())?;
+  // 誤ったパスワードでは移行しない。
+  if attempt(&mut store, &mut gate, &"carol", &"carol-password-2", 10).kind != 0 {
+    return Ok(501);
+  }
+  match row_of(&mut store, &"carol") {
+    None => {
+      return Ok(502);
+    }
+    Some(row) => {
+      if row.row_record != stale {
+        return Ok(503);
+      }
+    }
+  }
+  if attempt(&mut store, &mut gate, &"carol", &"carol-password-1", 11).kind != 1 {
+    return Ok(504);
+  }
+  let mut upgraded = Bytes.new();
+  match row_of(&mut store, &"carol") {
+    None => {
+      return Ok(505);
+    }
+    Some(row) => {
+      if iterations_of(&row.row_record) != 5000 || row.row_record == stale || row.row_generation != 0 || row.row_status != status_active() {
+        return Ok(506);
+      }
+      upgraded = row.row_record.clone();
+    }
+  }
+  // 移行後の記録でも同じパスワードで入れ、すでに設定以上なので再び書き換わらない。
+  if attempt(&mut store, &mut gate, &"carol", &"carol-password-1", 12).kind != 1 {
+    return Ok(507);
+  }
+  match row_of(&mut store, &"carol") {
+    None => {
+      return Ok(508);
+    }
+    Some(row) => {
+      if row.row_record != upgraded {
+        return Ok(509);
+      }
+    }
+  }
+  // 古い記録を前提にした置き換えは、保存中の記録が違えば何もしない。
+  if upgrade_record(&mut store, &name(&"carol"), &stale, &stale)? {
+    return Ok(510);
+  }
+  match row_of(&mut store, &"carol") {
+    None => {
+      return Ok(511);
+    }
+    Some(row) => {
+      if row.row_record != upgraded {
+        return Ok(512);
+      }
+    }
+  }
+  close_users(store)?;
+  return Ok(0);
+}
+
+pub fn main() -> Int
+  intent "利用者表・ログイン・抑制・移行の試験をすべて実行し、通れば 0、落ちた試験の番号を返す"
+  requires none
+  ensures none
+  effects fs, random, task.suspend
+{
+  let dir = "/tmp/sigil_rune_auth_stage_two_users";
+  let mut code = registration_rules(&dir).unwrap_or(100);
+  if code == 0 {
+    code = login_is_uniform(&dir).unwrap_or(200);
+  }
+  if code == 0 {
+    code = throttle_in_login(&dir).unwrap_or(300);
+  }
+  if code == 0 {
+    code = generation_and_password(&dir).unwrap_or(400);
+  }
+  if code == 0 {
+    code = migration(&dir).unwrap_or(500);
+  }
+  remove_tree(&dir);
+  return code;
+}
