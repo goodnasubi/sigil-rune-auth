@@ -15,6 +15,7 @@ use db.relation.ScanOrder;
 use db.relation.column;
 use db.relation.rel_create_index;
 use db.relation.rel_create_table;
+use db.relation.rel_get;
 use db.relation.rel_insert;
 use db.relation.rel_replace;
 use db.relation.rel_scan_index;
@@ -367,6 +368,28 @@ pub fn lookup_user(store: &mut UserStore, username: &Bytes) -> Result<Option<Use
   let found = find_row(&mut store, &mut tx, &username)?;
   let _ = tx_rollback(&mut tx, &mut store.database);
   return Ok(found);
+}
+
+pub fn lookup_user_by_id(store: &mut UserStore, user_id: &Bytes) -> Result<Option<UserRow>, UserError>
+  intent "主キーで現在の状態と世代を含む行を読む"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin(&mut store)?;
+  let key = Value.BytesVal(user_id.clone());
+  match rel_get(&store.database, &mut tx, &table_name(), &key) {
+    Err(e) => {
+      return Err(abandon(&mut store, &mut tx, &e));
+    }
+    Ok(found) => {
+      let _ = tx_rollback(&mut tx, &mut store.database);
+      return match found {
+        Some(row) => Ok(Some(to_user_row(&row))),
+        None => Ok(None),
+      };
+    }
+  }
 }
 
 fn fresh_record(password: &Secret, iterations: Int) -> Result<Bytes, UserError>
