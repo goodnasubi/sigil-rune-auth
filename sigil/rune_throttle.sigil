@@ -184,20 +184,29 @@ fn make_room(throttle: &mut Throttle, now: Int)
     }
     j = j + 1;
   }
-  let mut trimmed = List.new();
-  let mut k = 0;
-  while k < kept.len() {
-    if k != victim {
-      match kept.get(k) {
+  throttle.entries = without_entry(&kept, victim);
+}
+
+fn without_entry(entries: &List<Attempt>, idx: Int) -> List<Attempt>
+  intent "指定した位置の記録を除き、残りの記録を順番どおりに返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut kept = List.new();
+  let mut i = 0;
+  while i < entries.len() {
+    if i != idx {
+      match entries.get(i) {
         None => {}
         Some(a) => {
-          trimmed.push(Attempt { attempt_key: a.attempt_key.clone(), window_start: a.window_start, failures: a.failures, locked_until: a.locked_until });
+          kept.push(Attempt { attempt_key: a.attempt_key.clone(), window_start: a.window_start, failures: a.failures, locked_until: a.locked_until });
         }
       }
     }
-    k = k + 1;
+    i = i + 1;
   }
-  throttle.entries = trimmed;
+  return kept;
 }
 
 pub fn lock_remaining(throttle: &mut Throttle, key: &Bytes, now: Int) -> Int
@@ -276,15 +285,16 @@ pub fn record_success(throttle: &mut Throttle, key: &Bytes, now: Int)
   if idx < 0 {
     return;
   }
-  match throttle.entries.get_mut(idx) {
-    None => {}
+  match throttle.entries.get(idx) {
+    None => {
+      return;
+    }
     Some(a) => {
       if a.locked_until > t {
         return;
       }
-      a.window_start = 0;
-      a.failures = 0;
-      a.locked_until = 0;
     }
   }
+  let kept = without_entry(&throttle.entries, idx);
+  throttle.entries = kept;
 }

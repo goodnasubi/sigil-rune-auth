@@ -131,16 +131,20 @@ fn success_clears() -> Int
   let mut t = new_throttle();
   fail_at(&mut t, &"alice", 4, 0);
   record_success(&mut t, &key(&"alice"), 10);
+  if tracked(&t) != 0 {
+    return 34;
+  }
   fail_at(&mut t, &"alice", 4, 20);
-  if lock_remaining(&mut t, &key(&"alice"), 24) != 0 {
+  if lock_remaining(&mut t, &key(&"alice"), 918) != 0 {
     return 31;
   }
-  record_failure(&mut t, &key(&"alice"), 24);
-  if lock_remaining(&mut t, &key(&"alice"), 24) != 900 {
+  // 成功後の最初の失敗（20 秒）から始まる窓の最後の秒。
+  record_failure(&mut t, &key(&"alice"), 919);
+  if lock_remaining(&mut t, &key(&"alice"), 919) != 900 {
     return 32;
   }
-  record_success(&mut t, &key(&"alice"), 30);
-  if lock_remaining(&mut t, &key(&"alice"), 30) != 894 {
+  record_success(&mut t, &key(&"alice"), 925);
+  if lock_remaining(&mut t, &key(&"alice"), 925) != 894 {
     return 33;
   }
   return 0;
