@@ -53,13 +53,13 @@ cp "$repo_root"/sigil/*.sigil "$root/"
 run_entry() {
   local entry=$1 label=$2 evaluator native
   "$sigil" check --root "$root" "$root/$entry.sigil"
-  evaluator=$("$sigil" run --root "$root" "$root/$entry.sigil" main)
+  evaluator=$("$sigil" run --root "$root" "$root/$entry.sigil" main | tail -n 1)
   if [[ "$evaluator" != 0 ]]; then
     printf '%s: evaluator test failed (%s)\n' "$label" "$evaluator" >&2
     exit 1
   fi
   "$sigil" build --root "$root" "$root/$entry.sigil" main -o "$scratch/$entry"
-  native=$("$scratch/$entry")
+  native=$("$scratch/$entry" | tail -n 1)
   if [[ "$native" != 0 ]]; then
     printf '%s: native test failed (%s)\n' "$label" "$native" >&2
     exit 1
