@@ -1,0 +1,323 @@
+module rune_auth
+  targets server
+  trust none
+
+fn be(value: Int, width: Int) -> Bytes
+  intent "非負の整数を指定幅の大端バイト列にする"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = width;
+  while i > 0 {
+    i = i - 1;
+    out.push(value >> 8 * i & 255);
+  }
+  return out;
+}
+
+fn read_be(record: &Bytes, start: Int, width: Int) -> Int
+  intent "幅と最上位ビットを検査済みの整数を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let mut value = 0;
+  let mut i = 0;
+  while i < width {
+    value = value * 256 + record.get(start + i).unwrap_or(0);
+    i = i + 1;
+  }
+  return value;
+}
+
+fn password_length(password: &Secret) -> Bool
+  intent "パスワード長をバイト単位で検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return password.byte_len() >= 12 && password.byte_len() <= 256;
+}
+
+pub fn encode_password(password: &Secret, salt: &Bytes, iterations: Int) -> Option<Bytes>
+  intent "指定した塩と反復回数で版 1 のパスワード記録を作る"
+  requires none
+  ensures none
+  effects task.suspend
+{
+  if !password_length(&password) || salt.byte_len() != 16 || iterations < 4096 || iterations > 100000 {
+    return None;
+  }
+  let mut record = Bytes.new();
+  record.push(1);
+  record.extend(&be(iterations, 4));
+  record.extend(&salt);
+  let derived = pbkdf2_sha256(&password, &salt, iterations, 32);
+  let digest = derived.expose();
+  record.extend(&digest);
+  let wipe_digest = Secret.from_bytes(digest);
+  return Some(record);
+}
+
+pub fn new_password(password: &Secret) -> Option<Bytes>
+  intent "OS 乱数の塩と初版の反復回数でパスワード記録を作る"
+  requires none
+  ensures none
+  effects random, task.suspend
+{
+  if !password_length(&password) {
+    return None;
+  }
+  return match random.bytes(16) {
+    None => None,
+    Some(salt) => encode_password(&password, &salt, 100000),
+  };
+}
+
+pub fn verify_password(password: &Secret, record: &Bytes) -> Bool
+  intent "公開の記録形式を検査してから導出鍵を定数時間で照合する"
+  requires none
+  ensures none
+  effects task.suspend
+{
+  if !password_length(&password) || record.byte_len() != 53 || record.get(0).unwrap_or(0) != 1 {
+    return false;
+  }
+  let iterations = read_be(&record, 1, 4);
+  if iterations < 4096 || iterations > 100000 {
+    return false;
+  }
+  let salt = record.slice(5, 21).unwrap_or(Bytes.new());
+  let expected = record.slice(21, 53).unwrap_or(Bytes.new());
+  let derived = pbkdf2_sha256(&password, &salt, iterations, 32);
+  let digest = derived.expose();
+  let matches = ct_eq(&digest, &expected);
+  let wipe_digest = Secret.from_bytes(digest);
+  let wipe_expected = Secret.from_bytes(expected);
+  return matches;
+}
+
+pub fn new_session_id() -> Option<Bytes>
+  intent "OS 乱数からセッション ID を得る"
+  requires none
+  ensures none
+  effects random
+{
+  return random.bytes(32);
+}
+
+pub fn new_user_id() -> Option<Bytes>
+  intent "OS 乱数から利用者 ID のバイナリ表現を得る"
+  requires none
+  ensures none
+  effects random
+{
+  return random.bytes(16);
+}
+
+fn hex(data: &Bytes) -> Bytes
+  intent "公開する ID またはハッシュを小文字 hex にする"
+  requires none
+  ensures none
+  effects none
+{
+  let digits = "0123456789abcdef".as_bytes();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < data.byte_len() {
+    let byte = data.get(i).unwrap_or(0);
+    out.push(digits.get(byte >> 4).unwrap_or(0));
+    out.push(digits.get(byte & 15).unwrap_or(0));
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn session_key(session_id: &Bytes) -> Option<Bytes>
+  intent "固定接頭辞とセッション ID の SHA-256 から KV キーを導く"
+  requires none
+  ensures none
+  effects none
+{
+  if session_id.byte_len() != 32 {
+    return None;
+  }
+  let mut key = "rune:session:".as_bytes();
+  let digest = sha256(&session_id);
+  key.extend(&hex(&digest));
+  return Some(key);
+}
+
+pub fn user_subject(user_id: &Bytes) -> Option<Bytes>
+  intent "16 バイトの利用者 ID を ADR 0060 の主体表記にする"
+  requires none
+  ensures none
+  effects none
+{
+  if user_id.byte_len() != 16 {
+    return None;
+  }
+  let mut subject = "u".as_bytes();
+  subject.extend(&hex(&user_id));
+  return Some(subject);
+}
+
+pub struct SessionRecord {
+  record_user_id: Bytes,
+  record_generation: Int,
+  record_issued_at: Int,
+  record_expires_at: Int,
+}
+
+impl SessionRecord {
+  pub fn user_id(self: &SessionRecord) -> Bytes
+    intent "利用者 IDを返す"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.record_user_id.clone();
+  }
+
+  pub fn generation(self: &SessionRecord) -> Int
+    intent "世代を返す"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.record_generation;
+  }
+
+  pub fn issued_at(self: &SessionRecord) -> Int
+    intent "発行時刻を返す"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.record_issued_at;
+  }
+
+  pub fn expires_at(self: &SessionRecord) -> Int
+    intent "期限を返す"
+    requires none
+    ensures none
+    effects none
+  {
+    return self.record_expires_at;
+  }
+}
+
+pub fn encode_session(user_id: &Bytes, generation: Int, issued_at: Int, expires_at: Int) -> Option<Bytes>
+  intent "セッション記録を版 1 の固定バイナリにする"
+  requires none
+  ensures none
+  effects none
+{
+  if user_id.byte_len() != 16 || generation < 0 || issued_at < 0 || expires_at <= issued_at {
+    return None;
+  }
+  let mut record = Bytes.new();
+  record.push(1);
+  record.extend(&user_id);
+  record.extend(&be(generation, 8));
+  record.extend(&be(issued_at, 8));
+  record.extend(&be(expires_at, 8));
+  return Some(record);
+}
+
+pub fn decode_session(record: &Bytes) -> Option<SessionRecord>
+  intent "版、長さ、整数の範囲と時刻順を検査して記録を読む"
+  requires none
+  ensures none
+  effects none
+{
+  if record.byte_len() != 41 || record.get(0).unwrap_or(0) != 1 || record.get(17).unwrap_or(255) >= 128 || record.get(25).unwrap_or(255) >= 128 || record.get(33).unwrap_or(255) >= 128 {
+    return None;
+  }
+  let issued_at = read_be(&record, 25, 8);
+  let expires_at = read_be(&record, 33, 8);
+  if expires_at <= issued_at {
+    return None;
+  }
+  return Some(SessionRecord { record_user_id: record.slice(1, 17).unwrap_or(Bytes.new()), record_generation: read_be(&record, 17, 8), record_issued_at: issued_at, record_expires_at: expires_at });
+}
+
+fn valid_audience(audience: &Bytes) -> Bool
+  intent "ADR 0037 の audience の長さと ASCII 文字を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  if audience.byte_len() < 1 || audience.byte_len() > 128 {
+    return false;
+  }
+  let mut i = 0;
+  while i < audience.byte_len() {
+    let c = audience.get(i).unwrap_or(0);
+    if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 58 || c == 45) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn base64url(data: &Bytes) -> Bytes
+  intent "公開するペイロードまたはタグをパディングなし base64url にする"
+  requires none
+  ensures none
+  effects none
+{
+  let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".as_bytes();
+  let mut out = Bytes.new();
+  let mut acc = 0;
+  let mut bits = 0;
+  let mut i = 0;
+  while i < data.byte_len() {
+    acc = acc << 8 | data.get(i).unwrap_or(0);
+    bits = bits + 8;
+    while bits >= 6 {
+      bits = bits - 6;
+      out.push(alphabet.get(acc >> bits & 63).unwrap_or(0));
+    }
+    acc = acc & (1 << bits) - 1;
+    i = i + 1;
+  }
+  if bits > 0 {
+    out.push(alphabet.get(acc << 6 - bits).unwrap_or(0));
+  }
+  return out;
+}
+
+pub fn issue_access_token(key: &Secret, audience: &String, user_id: &Bytes, issued_at: Int, lifetime: Int) -> Option<Bytes>
+  intent "呼び出し側が選んだ audience の鍵で ADR 0037 のアクセストークンを発行する"
+  requires none
+  ensures none
+  effects none
+{
+  if key.byte_len() != 32 || lifetime < 60 || lifetime > 3600 || issued_at < 0 || issued_at > 253402300799 - lifetime {
+    return None;
+  }
+  let aud = audience.as_bytes();
+  if !valid_audience(&aud) {
+    return None;
+  }
+  if user_id.byte_len() != 16 {
+    return None;
+  }
+  let subject = user_subject(&user_id).unwrap_or(Bytes.new());
+  let mut payload = be(issued_at, 8);
+  payload.extend(&be(issued_at + lifetime, 8));
+  payload.extend(&be(aud.byte_len(), 2));
+  payload.extend(&aud);
+  payload.extend(&be(subject.byte_len(), 2));
+  payload.extend(&subject);
+  let mut token = "sigil1.".as_bytes();
+  token.extend(&base64url(&payload));
+  let mac = hmac_sha256(&key, &token);
+  token.push(46);
+  token.extend(&base64url(&mac.expose()));
+  return Some(token);
+}
