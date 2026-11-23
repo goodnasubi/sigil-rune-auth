@@ -80,10 +80,9 @@ rune_cli <register|disable|bump-generation|set-password> --dir=<DB ディレク�
 
 ## 検証
 
-Linux x86-64 で Git、Rustup、C リンカーを用意し、`scripts/check.sh` を実行します。Sigil のコンパイラ・埋め込み標準ライブラリ・ネイティブ核は同一のコミット `ba4a5f1b7bf4764521cdef1ee60daf1819d30f81`、sigil-db 核は `9483e36f08c35bfc62b3beeb008a531887506037` を使用します（どちらも取得後にコミットと変更なしを確認します）。Rust は 1.100.0、依存クレートは同コミットの `Cargo.lock` で固定します。KV は段 2 の `7dfcf15b24251d80904f8d54e54b735652b89303` に固定します。スクリプトは固定した処理系で Cargo の fmt と Clippy を実行し、その処理系の評価器とネイティブ出力で段 1〜3 の試験を実行します。段 3 の試験は永続 KV の期限境界、WAL 障害後の再試行と失効、世代変更と無効化を検査します。TCP 経由の試験は後続対応です。段 2 の試験は、抑制の境界（`stage_two_throttle_test`）、利用者表・ログイン・移行（`stage_two_users_test`）、中断・復旧（`stage_two_recovery_test`）、CLI（`stage_two_cli_test`）です。中断・復旧は、4 つの更新の全 I/O の関門を 3 通り（I/O 失敗・クラッシュ・書き込みの途中切れ）で中断し、再起動後の行が「完全に入った」か「まったく入っていない」かのどちらかであることと、一意索引と表が食い違わないことを確かめます。最後に、実行ファイルの引数・終了コード・出力を煙試験で確かめます。試験は PBKDF2 の反復回数を規則の下限 4096 にして時間を抑えています（煙試験の `register` 1 回だけ実運用の 100,000 回です）。
+Linux x86-64 で Git、Rustup、C リンカーを用意し、`scripts/check.sh` を実行します。Sigil のコンパイラ・埋め込み標準ライブラリ・ネイティブ核は同一のコミット `15beabc44aff08a0566abe3405d722e35b9b8aa5`、sigil-db 核は `9483e36f08c35bfc62b3beeb008a531887506037` を使用します（どちらも取得後にコミットと変更なしを確認します）。Rust は 1.100.0、依存クレートは同コミットの `Cargo.lock` で固定します。KV は段 2 の `7dfcf15b24251d80904f8d54e54b735652b89303` に固定します。スクリプトは Cargo の fmt と Clippy を実行し、固定した処理系の `sigil test --ct` で `Sigil.toml` に登録した導出鍵の照合関数を静的検査と CLIF 検査にかけます。同じ処理系の評価器とネイティブ出力で段 1〜3 の試験も実行します。段 3 の試験は永続 KV の期限境界、WAL 障害後の再試行と失効、世代変更と無効化を検査します。TCP 経由の試験は後続対応です。段 2 の試験は、抑制の境界（`stage_two_throttle_test`）、利用者表・ログイン・移行（`stage_two_users_test`）、中断・復旧（`stage_two_recovery_test`）、CLI（`stage_two_cli_test`）です。中断・復旧は、4 つの更新の全 I/O の関門を 3 通り（I/O 失敗・クラッシュ・書き込みの途中切れ）で中断し、再起動後の行が「完全に入った」か「まったく入っていない」かのどちらかであることと、一意索引と表が食い違わないことを確かめます。最後に、実行ファイルの引数・終了コード・出力を煙試験で確かめます。試験は PBKDF2 の反復回数を規則の下限 4096 にして時間を抑えています（煙試験の `register` 1 回だけ実運用の 100,000 回です）。
 
-試験の固定値は Python 標準ライブラリの `hashlib.pbkdf2_hmac`、`hashlib.sha256`、`struct.pack`、`base64.urlsafe_b64encode`、`hmac.digest` で独立に算出しました。[Issue #1][issue] に定数時間性の検査登録について記録します。
+試験の固定値は Python 標準ライブラリの `hashlib.pbkdf2_hmac`、`hashlib.sha256`、`struct.pack`、`base64.urlsafe_b64encode`、`hmac.digest` で独立に算出しました。
 
 [adr0060]: https://github.com/goodnasubi/sigil/blob/ba4a5f1b7bf4764521cdef1ee60daf1819d30f81/docs/decisions/0060-rune-auth.md
 [adr0037]: https://github.com/goodnasubi/sigil/blob/ba4a5f1b7bf4764521cdef1ee60daf1819d30f81/docs/decisions/0037-p1-authentication.md
-[issue]: https://github.com/goodnasubi/sigil-rune-auth/issues/1
