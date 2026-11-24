@@ -1,0 +1,1036 @@
+module rune_http
+  targets server
+  trust none
+
+use rune_auth.hex;
+use rune_auth.issue_access_token;
+use rune_auth.user_subject;
+use rune_login.LoginGate;
+use rune_login.LoginOutcome;
+use rune_login.login;
+use rune_sessions.LogoutOutcome;
+use rune_sessions.PendingLogouts;
+use rune_sessions.clear_session_cookie;
+use rune_sessions.session_cookie;
+use rune_sessions_persistent.issue_session;
+use rune_sessions_persistent.logout_session;
+use rune_sessions_persistent.validate_session;
+use rune_throttle.Throttle;
+use rune_throttle.lock_remaining;
+use rune_throttle.new_throttle;
+use rune_throttle.record_failure;
+use rune_throttle.throttle_key;
+use rune_users.UserStore;
+use stash.persistent.PersistentStore;
+
+// ADR 0060 段 4: HTTP サービス
+//
+// 4 つのエンドポイント:
+// - POST /auth/login
+// - POST /auth/logout
+// - GET  /auth/session
+// - POST /auth/token
+//
+// 規則:
+// - 状態を変える要求（login・logout・token）は Content-Type: application/json かつ
+//   Origin が設定した公開オリジンと完全一致のときだけ受け付ける。Origin が無い要求は拒否する。
+// - すべて JSON。応答は固定形式で、理由別の本文を作らない。
+// - 一様な 401（利用者の有無や誤パスワードで応答を変えない）。制限超過は 429。成否不明のログアウトは 503。
+// - キー・パスワード・セッション ID・トークン・Authorization・Cookie をログ・エラー・応答に出さない。
+// - 要求のファジングと上限（本文・フィールド長上限、厳格な JSON、同時 PBKDF2 上限、パスワード長上限）。
+
+pub struct AudienceConfig {
+  name: String,
+  key: Secret,
+}
+
+pub fn new_audience_config(name: String, key: Secret) -> AudienceConfig
+  intent "登録済み audience とその 32 バイト HMAC 署名鍵を保持する"
+  requires none
+  ensures none
+  effects none
+{
+  return AudienceConfig { name: name, key: key };
+}
+
+pub struct HttpConfig {
+  origin: String,
+  session_lifetime: Int,
+  token_lifetime: Int,
+  max_body_bytes: Int,
+  max_concurrent_pbkdf2: Int,
+  trusted_proxies: List<String>,
+  audiences: List<AudienceConfig>,
+}
+
+pub fn new_http_config(origin: String, session_lifetime: Int, token_lifetime: Int, max_body_bytes: Int, max_concurrent_pbkdf2: Int, trusted_proxies: List<String>, audiences: List<AudienceConfig>) -> HttpConfig
+  intent "HTTP サービスの設定を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return HttpConfig { origin: origin, session_lifetime: session_lifetime, token_lifetime: token_lifetime, max_body_bytes: max_body_bytes, max_concurrent_pbkdf2: max_concurrent_pbkdf2, trusted_proxies: trusted_proxies, audiences: audiences };
+}
+
+pub fn default_http_config(origin: String, audiences: List<AudienceConfig>) -> HttpConfig
+  intent "既定値の設定を作る（セッション8時間、トークン300秒、本文上限4096バイト、同時PBKDF2上限4）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut trusted = List.new();
+  trusted.push("127.0.0.1");
+  trusted.push("::1");
+  return HttpConfig { origin: origin, session_lifetime: 28800, token_lifetime: 300, max_body_bytes: 4096, max_concurrent_pbkdf2: 4, trusted_proxies: trusted, audiences: audiences };
+}
+
+pub struct HttpService {
+  config: HttpConfig,
+  ip_throttle: Throttle,
+  active_pbkdf2: Int,
+}
+
+pub fn new_http_service(config: HttpConfig) -> HttpService
+  intent "HTTP サービスの状態（設定・接続元IP抑制・並行PBKDF2数）を初期化する"
+  requires none
+  ensures none
+  effects none
+{
+  return HttpService { config: config, ip_throttle: new_throttle(), active_pbkdf2: 0 };
+}
+
+pub fn decimal(value: Int) -> String
+  intent "非負整数を十進の文字列にする"
+  requires none
+  ensures none
+  effects none
+{
+  if value <= 0 {
+    return "0";
+  }
+  let mut reverse = Bytes.new();
+  let mut n = value;
+  while n > 0 {
+    reverse.push(48 + n % 10);
+    n = n / 10;
+  }
+  let mut digits = Bytes.new();
+  let mut i = reverse.byte_len();
+  while i > 0 {
+    i = i - 1;
+    digits.push(reverse.get(i).unwrap_or(48));
+  }
+  return digits.to_string_utf8().unwrap_or("0");
+}
+
+pub fn json_response(status: Int, body: String) -> HttpResponse
+  intent "JSON 本文と固定ヘッダー（Content-Type, Cache-Control: no-store）を持つ応答を作る"
+  requires 200 <= status && status <= 599
+  ensures none
+  effects none
+{
+  return HttpResponse.new(status, body.as_bytes()).with_header(&"content-type", &"application/json".as_bytes()).with_header(&"cache-control", &"no-store".as_bytes());
+}
+
+pub fn fixed_ok() -> HttpResponse
+  intent "固定の 200 OK 応答を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return json_response(200, "{\"status\":\"ok\"}");
+}
+
+pub fn fixed_bad_request() -> HttpResponse
+  intent "固定の 400 Bad Request 応答を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return json_response(400, "{\"error\":\"bad_request\"}");
+}
+
+pub fn fixed_unauthorized() -> HttpResponse
+  intent "固定の一様な 401 Unauthorized 応答を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return json_response(401, "{\"error\":\"unauthorized\"}");
+}
+
+pub fn fixed_forbidden() -> HttpResponse
+  intent "固定の 403 Forbidden 応答を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return json_response(403, "{\"error\":\"forbidden\"}");
+}
+
+pub fn fixed_not_found() -> HttpResponse
+  intent "固定の 404 Not Found 応答を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return json_response(404, "{\"error\":\"not_found\"}");
+}
+
+pub fn fixed_method_not_allowed() -> HttpResponse
+  intent "固定の 405 Method Not Allowed 応答を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return json_response(405, "{\"error\":\"method_not_allowed\"}");
+}
+
+pub fn fixed_payload_too_large() -> HttpResponse
+  intent "固定の 413 Payload Too Large 応答を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return json_response(413, "{\"error\":\"payload_too_large\"}");
+}
+
+pub fn fixed_too_many_requests(retry_after: Int) -> HttpResponse
+  intent "固定の 429 Too Many Requests 応答と Retry-After ヘッダーを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let s = match retry_after < 1 {
+    true => 1,
+    false => retry_after,
+  };
+  return HttpResponse.new(429, "{\"error\":\"too_many_requests\"}".as_bytes()).with_header(&"content-type", &"application/json".as_bytes()).with_header(&"cache-control", &"no-store".as_bytes()).with_header(&"retry-after", &decimal(s).as_bytes());
+}
+
+pub fn fixed_internal_error() -> HttpResponse
+  intent "固定の 500 Internal Server Error 応答を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return json_response(500, "{\"error\":\"internal_error\"}");
+}
+
+pub fn fixed_service_unavailable() -> HttpResponse
+  intent "固定の 503 Service Unavailable 応答を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return json_response(503, "{\"error\":\"service_unavailable\"}");
+}
+
+fn lower_byte(b: Int) -> Int
+  intent "ASCII 大文字を小文字にする"
+  requires none
+  ensures none
+  effects none
+{
+  if b >= 65 && b <= 90 {
+    return b + 32;
+  }
+  return b;
+}
+
+fn bytes_starts_with_case_insensitive(data: &Bytes, prefix: &Bytes) -> Bool
+  intent "大文字小文字を区別せず先頭一致を調べる"
+  requires none
+  ensures none
+  effects none
+{
+  if data.byte_len() < prefix.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < prefix.byte_len() {
+    let d = lower_byte(data.get(i).unwrap_or(0));
+    let p = lower_byte(prefix.get(i).unwrap_or(0));
+    if d != p {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn parse_hex_digit(b: Int) -> Option<Int>
+  intent "小文字 hex 1 桁の数値を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if b >= 48 && b <= 57 {
+    return Some(b - 48);
+  }
+  if b >= 97 && b <= 102 {
+    return Some(b - 97 + 10);
+  }
+  return None;
+}
+
+fn hex_to_bytes(hex: &Bytes) -> Option<Bytes>
+  intent "64 桁の小文字 hex を 32 バイトのバイナリにする"
+  requires none
+  ensures none
+  effects none
+{
+  if hex.byte_len() != 64 {
+    return None;
+  }
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < 64 {
+    let hi = parse_hex_digit(hex.get(i).unwrap_or(0))?;
+    let lo = parse_hex_digit(hex.get(i + 1).unwrap_or(0))?;
+    out.push(hi * 16 + lo);
+    i = i + 2;
+  }
+  return Some(out);
+}
+
+pub fn extract_session_id(req: &HttpRequest) -> Option<Secret>
+  intent "Cookie 見出しから __Host-sigil_session の 64 桁 hex を取り出し 32 バイトの Secret にする"
+  requires none
+  ensures none
+  effects none
+{
+  let cookie_val = req.header(&"cookie")?;
+  let target = "__Host-sigil_session=".as_bytes();
+  let t_len = target.byte_len();
+  let v_len = cookie_val.byte_len();
+  let mut i = 0;
+  while i < v_len {
+    while i < v_len && (cookie_val.get(i).unwrap_or(0) == 32 || cookie_val.get(i).unwrap_or(0) == 9) {
+      i = i + 1;
+    }
+    if i + t_len <= v_len {
+      let mut matched = true;
+      let mut k = 0;
+      while k < t_len && matched {
+        if cookie_val.get(i + k).unwrap_or(0) != target.get(k).unwrap_or(0) {
+          matched = false;
+        } else {
+          k = k + 1;
+        }
+      }
+      if matched {
+        let val_start = i + t_len;
+        let mut val_end = val_start;
+        while val_end < v_len && cookie_val.get(val_end).unwrap_or(0) != 59 {
+          val_end = val_end + 1;
+        }
+        let mut hex_slice = Bytes.new();
+        match cookie_val.slice(val_start, val_end) {
+          Ok(s) => {
+            hex_slice = s;
+          }
+          Err(_) => {
+            return None;
+          }
+        }
+        return match hex_to_bytes(&hex_slice) {
+          Some(raw_id) => Some(Secret.from_bytes(raw_id)),
+          None => None,
+        };
+      }
+    }
+    while i < v_len && cookie_val.get(i).unwrap_or(0) != 59 {
+      i = i + 1;
+    }
+    if i < v_len && cookie_val.get(i).unwrap_or(0) == 59 {
+      i = i + 1;
+    }
+  }
+  return None;
+}
+
+fn is_trusted_proxy(trusted: &List<String>, remote: &String) -> Bool
+  intent "接続元が信頼するプロキシの一覧に含まれるか"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < trusted.len() {
+    match trusted.get(i) {
+      Some(t) => {
+        if t == remote {
+          return true;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+pub fn extract_client_ip(req: &HttpRequest, remote_addr: &String, trusted_proxies: &List<String>) -> String
+  intent "信頼プロキシからの接続時は X-Forwarded-For を参照し、それ以外は接続元 IP を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if !is_trusted_proxy(&trusted_proxies, &remote_addr) {
+    return remote_addr.clone();
+  }
+  match req.header(&"x-forwarded-for") {
+    None => {
+      return remote_addr.clone();
+    }
+    Some(raw_header) => {
+      let len = raw_header.byte_len();
+      if len == 0 {
+        return remote_addr.clone();
+      }
+      let mut end = len;
+      while end > 0 && (raw_header.get(end - 1).unwrap_or(0) == 32 || raw_header.get(end - 1).unwrap_or(0) == 9) {
+        end = end - 1;
+      }
+      let mut start = end;
+      while start > 0 && raw_header.get(start - 1).unwrap_or(0) != 44 {
+        start = start - 1;
+      }
+      while start < end && (raw_header.get(start).unwrap_or(0) == 32 || raw_header.get(start).unwrap_or(0) == 9) {
+        start = start + 1;
+      }
+      if start >= end {
+        return remote_addr.clone();
+      }
+      let ip_bytes = raw_header.slice(start, end).unwrap_or(Bytes.new());
+      return match ip_bytes.to_string_utf8() {
+        Ok(s) => s,
+        Err(_) => remote_addr.clone(),
+      };
+    }
+  }
+}
+
+pub fn check_csrf(req: &HttpRequest, public_origin: &String) -> Result<Bool, HttpResponse>
+  intent "Origin と Content-Type を検査し、不正なら固定の拒否応答を返す"
+  requires none
+  ensures none
+  effects none
+{
+  match req.header(&"content-type") {
+    None => {
+      return Err(fixed_bad_request());
+    }
+    Some(ct) => {
+      let app_json = "application/json".as_bytes();
+      if !bytes_starts_with_case_insensitive(&ct, &app_json) {
+        return Err(fixed_bad_request());
+      }
+    }
+  }
+  match req.header(&"origin") {
+    None => {
+      return Err(fixed_forbidden());
+    }
+    Some(org) => {
+      let org_str = org.to_string_utf8().unwrap_or("");
+      if org_str != public_origin {
+        return Err(fixed_forbidden());
+      }
+    }
+  }
+  return Ok(true);
+}
+
+fn get_field_index(fields: &List<JsonField>, name: &String) -> Option<Int>
+  intent "フィールド一覧から名前が一致するインデックスを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < fields.len() {
+    match fields.get(i) {
+      Some(f) => {
+        if f.name() == name {
+          return Some(f.index());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn get_string_field(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String) -> Option<String>
+  intent "指定キーの文字列値を取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  let idx = get_field_index(&fields, &name)?;
+  return match nodes.get(idx) {
+    Some(JsonNode.Str(s)) => Some(s.clone()),
+    _ => None,
+  };
+}
+
+fn check_no_unknown_keys(fields: &List<JsonField>, allowed: &List<String>) -> Bool
+  intent "許可されたキー以外の未知のキーが含まれていないか検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < fields.len() {
+    match fields.get(i) {
+      Some(f) => {
+        let name = f.name();
+        let mut ok = false;
+        let mut j = 0;
+        while j < allowed.len() && !ok {
+          match allowed.get(j) {
+            Some(a) => {
+              if a == name {
+                ok = true;
+              }
+            }
+            None => {}
+          }
+          j = j + 1;
+        }
+        if !ok {
+          return false;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn check_no_duplicate_keys(fields: &List<JsonField>) -> Bool
+  intent "JSON オブジェクト内のキー重複を拒否する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < fields.len() {
+    match fields.get(i) {
+      Some(f1) => {
+        let name1 = f1.name();
+        let mut j = i + 1;
+        while j < fields.len() {
+          match fields.get(j) {
+            Some(f2) => {
+              if f2.name() == name1 {
+                return false;
+              }
+            }
+            None => {}
+          }
+          j = j + 1;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn is_valid_username_char(c: Int) -> Bool
+  intent "利用者名の文字種 [a-z0-9._@-] を判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 64 || c == 45;
+}
+
+fn is_valid_username(username: &Bytes) -> Bool
+  intent "利用者名の長さ（1〜64）と文字種を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  if username.byte_len() < 1 || username.byte_len() > 64 {
+    return false;
+  }
+  let mut i = 0;
+  while i < username.byte_len() {
+    if !is_valid_username_char(username.get(i).unwrap_or(0)) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn is_valid_audience_char(c: Int) -> Bool
+  intent "audience の文字種 [A-Za-z0-9._:-] を判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 58 || c == 45;
+}
+
+fn is_valid_audience(aud: &Bytes) -> Bool
+  intent "audience の長さ（1〜128）と文字種を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  if aud.byte_len() < 1 || aud.byte_len() > 128 {
+    return false;
+  }
+  let mut i = 0;
+  while i < aud.byte_len() {
+    if !is_valid_audience_char(aud.get(i).unwrap_or(0)) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn handle_login(service: &mut HttpService, users: &mut UserStore, gate: &mut LoginGate, kv: &mut PersistentStore, req: &HttpRequest, remote_addr: &String, sample_time: fn() -> Option<Int>) -> HttpResponse
+  intent "POST /auth/login を処理する"
+  requires none
+  ensures none
+  effects of(sample_time), fs, random, task.suspend
+{
+  if req.method() != "POST" {
+    return fixed_method_not_allowed();
+  }
+  if req.body_len() > service.config.max_body_bytes {
+    return fixed_payload_too_large();
+  }
+  match check_csrf(&req, &service.config.origin) {
+    Err(resp) => {
+      return resp;
+    }
+    Ok(_) => {}
+  }
+
+  let mut doc = JsonValue.new(List.new(), 0);
+  match json.parse(&req.body()) {
+    Ok(d) => {
+      doc = d;
+    }
+    Err(_) => {
+      return fixed_bad_request();
+    }
+  }
+  let nodes = doc.nodes();
+  let mut fields = List.new();
+  match nodes.get(doc.root()) {
+    Some(JsonNode.Object(f)) => {
+      fields = f.clone();
+    }
+    _ => {
+      return fixed_bad_request();
+    }
+  }
+
+  let mut allowed = List.new();
+  allowed.push("username");
+  allowed.push("password");
+  if !check_no_unknown_keys(&fields, &allowed) || !check_no_duplicate_keys(&fields) {
+    return fixed_bad_request();
+  }
+
+  let mut username_str = "";
+  match get_string_field(&nodes, &fields, &"username") {
+    Some(s) => {
+      username_str = s;
+    }
+    None => {
+      return fixed_bad_request();
+    }
+  }
+  let mut password_str = "";
+  match get_string_field(&nodes, &fields, &"password") {
+    Some(s) => {
+      password_str = s;
+    }
+    None => {
+      return fixed_bad_request();
+    }
+  }
+
+  let username_bytes = username_str.as_bytes();
+  if !is_valid_username(&username_bytes) {
+    return fixed_bad_request();
+  }
+  let password_bytes = password_str.as_bytes();
+  if password_bytes.byte_len() < 12 || password_bytes.byte_len() > 256 {
+    return fixed_bad_request();
+  }
+
+  let mut now = 0;
+  match sample_time() {
+    Some(t) => {
+      now = t;
+    }
+    None => {
+      return fixed_internal_error();
+    }
+  }
+
+  let client_ip = extract_client_ip(&req, &remote_addr, &service.config.trusted_proxies);
+  let ip_key = throttle_key(&client_ip.as_bytes());
+  let ip_wait = lock_remaining(&mut service.ip_throttle, &ip_key, now);
+  if ip_wait > 0 {
+    return fixed_too_many_requests(ip_wait);
+  }
+
+  // 同時 PBKDF2 数上限の検査（段 4 では逐次同期実行のため未実装。カウンタ境界のみ提供・試験）
+  if service.active_pbkdf2 >= service.config.max_concurrent_pbkdf2 {
+    return fixed_too_many_requests(1);
+  }
+
+  service.active_pbkdf2 = service.active_pbkdf2 + 1;
+  let password_secret = Secret.from_bytes(password_bytes);
+  let login_result = login(&mut users, &mut gate, &username_bytes, &password_secret, now);
+  service.active_pbkdf2 = service.active_pbkdf2 - 1;
+
+  match login_result {
+    Err(_) => {
+      return fixed_internal_error();
+    }
+    Ok(LoginOutcome.Throttled(wait)) => {
+      return fixed_too_many_requests(wait);
+    }
+    Ok(LoginOutcome.Failed) => {
+      record_failure(&mut service.ip_throttle, &ip_key, now);
+      return fixed_unauthorized();
+    }
+    Ok(LoginOutcome.Success(user_id, generation)) => {
+      // ログイン成功時に IP の失敗数はリセットしない（パスワードスプレー対策。窓の経過でのみ解除）
+      match issue_session(&mut kv, &user_id, generation, service.config.session_lifetime, sample_time) {
+        Err(_) => {
+          return fixed_internal_error();
+        }
+        Ok(session_id) => {
+          let cookie_header = session_cookie(&session_id);
+          return HttpResponse.new(200, "{\"status\":\"ok\"}".as_bytes()).with_header(&"content-type", &"application/json".as_bytes()).with_header(&"cache-control", &"no-store".as_bytes()).with_header(&"set-cookie", &cookie_header.expose());
+        }
+      }
+    }
+  }
+}
+
+fn handle_logout(service: &mut HttpService, kv: &mut PersistentStore, pending: &mut PendingLogouts, req: &HttpRequest) -> HttpResponse
+  intent "POST /auth/logout を処理する"
+  requires none
+  ensures none
+  effects fs
+{
+  if req.method() != "POST" {
+    return fixed_method_not_allowed();
+  }
+  if req.body_len() > service.config.max_body_bytes {
+    return fixed_payload_too_large();
+  }
+  match check_csrf(&req, &service.config.origin) {
+    Err(resp) => {
+      return resp;
+    }
+    Ok(_) => {}
+  }
+
+  if req.body_len() > 0 {
+    let mut doc = JsonValue.new(List.new(), 0);
+    match json.parse(&req.body()) {
+      Ok(d) => {
+        doc = d;
+      }
+      Err(_) => {
+        return fixed_bad_request();
+      }
+    }
+    let nodes = doc.nodes();
+    let mut fields = List.new();
+    match nodes.get(doc.root()) {
+      Some(JsonNode.Object(f)) => {
+        fields = f.clone();
+      }
+      _ => {
+        return fixed_bad_request();
+      }
+    }
+    let allowed = List.new();
+    if !check_no_unknown_keys(&fields, &allowed) || !check_no_duplicate_keys(&fields) {
+      return fixed_bad_request();
+    }
+  }
+
+  let clear_cookie_val = clear_session_cookie().as_bytes();
+  return match extract_session_id(&req) {
+    None => HttpResponse.new(200, "{\"status\":\"ok\"}".as_bytes()).with_header(&"content-type", &"application/json".as_bytes()).with_header(&"cache-control", &"no-store".as_bytes()).with_header(&"set-cookie", &clear_cookie_val),
+    Some(session_id) => match logout_session(&mut kv, &mut pending, &session_id) {
+      LogoutOutcome.Complete => HttpResponse.new(200, "{\"status\":\"ok\"}".as_bytes()).with_header(&"content-type", &"application/json".as_bytes()).with_header(&"cache-control", &"no-store".as_bytes()).with_header(&"set-cookie", &clear_cookie_val),
+      LogoutOutcome.Unavailable => HttpResponse.new(503, "{\"error\":\"service_unavailable\"}".as_bytes()).with_header(&"content-type", &"application/json".as_bytes()).with_header(&"cache-control", &"no-store".as_bytes()).with_header(&"set-cookie", &clear_cookie_val),
+    },
+  };
+}
+
+fn handle_session(kv: &mut PersistentStore, users: &mut UserStore, pending: &PendingLogouts, req: &HttpRequest, sample_time: fn() -> Option<Int>) -> HttpResponse
+  intent "GET /auth/session を処理する"
+  requires none
+  ensures none
+  effects of(sample_time), fs
+{
+  if req.method() != "GET" {
+    return fixed_method_not_allowed();
+  }
+  let mut session_id = Secret.from_bytes(Bytes.new());
+  match extract_session_id(&req) {
+    Some(s) => {
+      session_id = s;
+    }
+    None => {
+      return fixed_unauthorized();
+    }
+  }
+
+  match validate_session(&mut kv, &mut users, &pending, &session_id, sample_time) {
+    None => {
+      return fixed_unauthorized();
+    }
+    Some(user_id) => {
+      let mut sub = Bytes.new();
+      match user_subject(&user_id) {
+        Some(s) => {
+          sub = s;
+        }
+        None => {
+          return fixed_internal_error();
+        }
+      }
+      let mut body = "{\"sub\":\"".as_bytes();
+      body.extend(&sub);
+      body.extend(&"\"}".as_bytes());
+      return HttpResponse.new(200, body).with_header(&"content-type", &"application/json".as_bytes()).with_header(&"cache-control", &"no-store".as_bytes());
+    }
+  }
+}
+
+fn handle_token(service: &HttpService, kv: &mut PersistentStore, users: &mut UserStore, pending: &PendingLogouts, req: &HttpRequest, sample_time: fn() -> Option<Int>) -> HttpResponse
+  intent "POST /auth/token を処理する"
+  requires none
+  ensures none
+  effects of(sample_time), fs
+{
+  if req.method() != "POST" {
+    return fixed_method_not_allowed();
+  }
+  if req.body_len() > service.config.max_body_bytes {
+    return fixed_payload_too_large();
+  }
+  match check_csrf(&req, &service.config.origin) {
+    Err(resp) => {
+      return resp;
+    }
+    Ok(_) => {}
+  }
+
+  let mut session_id = Secret.from_bytes(Bytes.new());
+  match extract_session_id(&req) {
+    Some(s) => {
+      session_id = s;
+    }
+    None => {
+      return fixed_unauthorized();
+    }
+  }
+
+  let mut user_id = Bytes.new();
+  match validate_session(&mut kv, &mut users, &pending, &session_id, sample_time) {
+    Some(uid) => {
+      user_id = uid;
+    }
+    None => {
+      return fixed_unauthorized();
+    }
+  }
+
+  let mut doc = JsonValue.new(List.new(), 0);
+  match json.parse(&req.body()) {
+    Ok(d) => {
+      doc = d;
+    }
+    Err(_) => {
+      return fixed_bad_request();
+    }
+  }
+  let nodes = doc.nodes();
+  let mut fields = List.new();
+  match nodes.get(doc.root()) {
+    Some(JsonNode.Object(f)) => {
+      fields = f.clone();
+    }
+    _ => {
+      return fixed_bad_request();
+    }
+  }
+
+  let mut allowed = List.new();
+  allowed.push("audience");
+  if !check_no_unknown_keys(&fields, &allowed) || !check_no_duplicate_keys(&fields) {
+    return fixed_bad_request();
+  }
+
+  let mut aud_str = "";
+  match get_string_field(&nodes, &fields, &"audience") {
+    Some(s) => {
+      aud_str = s;
+    }
+    None => {
+      return fixed_bad_request();
+    }
+  }
+  let aud_bytes = aud_str.as_bytes();
+  if !is_valid_audience(&aud_bytes) {
+    return fixed_bad_request();
+  }
+
+  let mut aud_key_bytes = Bytes.new();
+  let mut found_aud = false;
+  let mut i = 0;
+  while i < service.config.audiences.len() && !found_aud {
+    match service.config.audiences.get(i) {
+      Some(aud_cfg) => {
+        if aud_cfg.name == aud_str {
+          aud_key_bytes = aud_cfg.key.expose();
+          found_aud = true;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  if !found_aud {
+    return fixed_forbidden();
+  }
+  let aud_key = Secret.from_bytes(aud_key_bytes);
+
+  let mut now = 0;
+  match sample_time() {
+    Some(t) => {
+      now = t;
+    }
+    None => {
+      return fixed_internal_error();
+    }
+  }
+
+  match issue_access_token(&aud_key, &aud_str, &user_id, now, service.config.token_lifetime) {
+    None => {
+      return fixed_internal_error();
+    }
+    Some(token_bytes) => {
+      let mut body = "{\"token\":\"".as_bytes();
+      body.extend(&token_bytes);
+      body.extend(&"\",\"expires_in\":".as_bytes());
+      body.extend(&decimal(service.config.token_lifetime).as_bytes());
+      body.extend(&"}".as_bytes());
+      return HttpResponse.new(200, body).with_header(&"content-type", &"application/json".as_bytes()).with_header(&"cache-control", &"no-store".as_bytes());
+    }
+  }
+}
+
+pub fn handle_auth_request(service: &mut HttpService, users: &mut UserStore, gate: &mut LoginGate, kv: &mut PersistentStore, pending: &mut PendingLogouts, req: &HttpRequest, remote_addr: &String, sample_time: fn() -> Option<Int>) -> HttpResponse
+  intent "4 つのエンドポイントへルーティングして処理する"
+  requires none
+  ensures none
+  effects of(sample_time), fs, random, task.suspend
+{
+  let path = req.path();
+  if path == "/auth/login".as_bytes() {
+    return handle_login(&mut service, &mut users, &mut gate, &mut kv, &req, &remote_addr, sample_time);
+  }
+  if path == "/auth/logout".as_bytes() {
+    return handle_logout(&mut service, &mut kv, &mut pending, &req);
+  }
+  if path == "/auth/session".as_bytes() {
+    return handle_session(&mut kv, &mut users, &pending, &req, sample_time);
+  }
+  if path == "/auth/token".as_bytes() {
+    return handle_token(&service, &mut kv, &mut users, &pending, &req, sample_time);
+  }
+  return fixed_not_found();
+}
+
+pub enum AuthEvent {
+  LoginSuccess,
+  LoginFailed,
+  LoginThrottled,
+  LogoutComplete,
+  LogoutUnavailable,
+  SessionValid,
+  SessionInvalid,
+  TokenIssued,
+  TokenForbidden,
+  CsrfRejected,
+  BadRequest,
+  RateLimited,
+}
+
+pub fn log_event_text(event: AuthEvent, user_id: &Option<Bytes>, client_ip: &String) -> String
+  intent "秘密を出さず利用者 ID と固定分類だけを記録文にする"
+  requires none
+  ensures none
+  effects none
+{
+  let mut s = "rune_auth: ip=".as_bytes();
+  s.extend(&client_ip.as_bytes());
+  s.extend(&" event=".as_bytes());
+  let ev_name = match event {
+    AuthEvent.LoginSuccess => "LOGIN_SUCCESS",
+    AuthEvent.LoginFailed => "LOGIN_FAILED",
+    AuthEvent.LoginThrottled => "LOGIN_THROTTLED",
+    AuthEvent.LogoutComplete => "LOGOUT_COMPLETE",
+    AuthEvent.LogoutUnavailable => "LOGOUT_UNAVAILABLE",
+    AuthEvent.SessionValid => "SESSION_VALID",
+    AuthEvent.SessionInvalid => "SESSION_INVALID",
+    AuthEvent.TokenIssued => "TOKEN_ISSUED",
+    AuthEvent.TokenForbidden => "TOKEN_FORBIDDEN",
+    AuthEvent.CsrfRejected => "CSRF_REJECTED",
+    AuthEvent.BadRequest => "BAD_REQUEST",
+    AuthEvent.RateLimited => "RATE_LIMITED",
+  };
+  s.extend(&ev_name.as_bytes());
+  match user_id {
+    Some(uid) => {
+      match user_subject(&uid) {
+        Some(sub) => {
+          s.extend(&" sub=".as_bytes());
+          s.extend(&sub);
+        }
+        None => {}
+      }
+    }
+    None => {}
+  }
+  return s.to_string_utf8().unwrap_or("");
+}
+
+pub fn parse_raw_request(wire: &String) -> Option<HttpRequest>
+  intent "ワイヤー形式の HTTP 文字列から HttpRequest を生成する（試験用）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut parser = http.parser(&http.default_limits());
+  return match parser.feed(&wire.as_bytes(), 0) {
+    Ok(HttpProgress.Done(req, _)) => Some(req),
+    _ => None,
+  };
+}
