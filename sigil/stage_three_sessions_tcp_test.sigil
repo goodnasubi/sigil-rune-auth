@@ -1,0 +1,148 @@
+module stage_three_sessions_tcp_test
+  targets server
+  trust none
+
+use rune_auth.encode_session;
+use rune_auth.session_key;
+use rune_sessions.SessionError;
+use rune_sessions.clear_session_cookie;
+use rune_sessions.default_session_lifetime;
+use rune_sessions.new_pending_logouts;
+use rune_sessions.session_cookie;
+use rune_sessions_tcp.issue_session;
+use rune_sessions_tcp.validate_session;
+use rune_users.close_users;
+use rune_users.insert_user;
+use stage_three_tcp_support.abort_persistent;
+use stage_three_tcp_support.new_server_ctx;
+use stage_three_tcp_support.serve_persistent;
+use stage_two_support.bytes;
+use stage_two_support.fixed_record;
+use stage_two_support.fresh;
+use stage_two_support.low_iterations;
+use stage_two_support.remove_tree;
+use stash.client.connect;
+use stash.client.put;
+use stash.memory.Ttl;
+use stash.persistent.open_persistent;
+
+fn exercise_tcp(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
+  intent "永続 KV を TCP 経由で使い、セッションの期限境界を検査する"
+  requires none
+  ensures none
+  effects clock, fs, net, random, task
+{
+  let code = task.roots_grace(4, 1000, |group| {
+    let mut users = match fresh(&users_dir, low_iterations()) {
+      Ok(value) => Ok(value),
+      Err(_) => Err(1),
+    }?;
+    let db_id = bytes(16, 5);
+    let kv = match open_persistent(kv_dir.clone(), db_id.clone(), true) {
+      Ok(value) => Ok(value),
+      Err(_) => Err(2),
+    }?;
+    let store = SyncShared.new(Lock.new(kv));
+    let time_cell = SyncShared.new(Atomic.new(1000));
+    let listener = match net.listen(&"127.0.0.1", 0, 16) {
+      Ok(l) => Ok(l),
+      Err(_) => Err(20),
+    }?;
+    let port = listener.local_port();
+    let slot = group.reserve();
+    slot.start(new_server_ctx(listener, store, time_cell.clone()), serve_persistent, abort_persistent);
+
+    let mut pending = new_pending_logouts();
+    let name = "alice".as_bytes();
+    let password = fixed_record(&"correct horse battery", 7, low_iterations());
+    let user = insert_user(&mut users, &name, &password, 1000).unwrap_or(Bytes.new());
+
+    let mut client = match connect(&"127.0.0.1", port) {
+      Ok(c) => Ok(c),
+      Err(_) => Err(21),
+    }?;
+
+    let start = move || Some(1000);
+    let before = move || Some(1299);
+    let boundary = move || Some(1300);
+
+    let first = match issue_session(&mut client, &user, 0, 300, start) {
+      Ok(value) => Ok(value),
+      Err(_) => Err(3),
+    }?;
+    let second = match issue_session(&mut client, &user, 0, default_session_lifetime(), start) {
+      Ok(value) => Ok(value),
+      Err(_) => Err(4),
+    }?;
+    if first.expose() == second.expose() {
+      return Err(5);
+    }
+
+    let c = time_cell.borrow();
+    c.store(1299);
+    if validate_session(&mut client, &mut users, &pending, &first, before) != Some(user.clone()) {
+      return Err(5);
+    }
+
+    c.store(1300);
+    if validate_session(&mut client, &mut users, &pending, &first, boundary).is_some() {
+      return Err(6);
+    }
+
+    // KV の期限より先に、記録自体の期限で失効させる。
+    let fixture = Secret.from_bytes(bytes(32, 0));
+    let fixture_key = session_key(&fixture.expose()).unwrap_or(Bytes.new());
+    let fixture_record = encode_session(&user, 0, 1300, 1301).unwrap_or(Bytes.new());
+    if put(&mut client, &fixture_key, &fixture_record, Ttl.Seconds(300)).is_err() {
+      return Err(7);
+    }
+
+    c.store(1301);
+    if validate_session(&mut client, &mut users, &pending, &fixture, move || Some(1301)).is_some() {
+      return Err(8);
+    }
+
+    let expected = "__Host-sigil_session=0000000000000000000000000000000000000000000000000000000000000000; Secure; HttpOnly; SameSite=Lax; Path=/";
+    if session_cookie(&fixture).expose() != expected.as_bytes() || clear_session_cookie() != "__Host-sigil_session=; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=0" {
+      return Err(9);
+    }
+
+    match issue_session(&mut client, &user, 0, 2592001, boundary) {
+      Err(SessionError.InvalidLifetime) => {}
+      _ => {
+        return Err(10);
+      }
+    }
+    match issue_session(&mut client, &user, 0, 300, move || None) {
+      Err(SessionError.ClockUnavailable) => {}
+      _ => {
+        return Err(11);
+      }
+    }
+
+    if close_users(users).is_err() {
+      return Err(12);
+    }
+    return Ok(0);
+  });
+
+  return code;
+}
+
+pub fn main() -> Int
+  intent "段 3 の TCP 経由セッション試験を実行し、失敗番号または 0 を返す"
+  requires none
+  ensures none
+  effects clock, fs, net, random, task
+{
+  let users = "/tmp/sigil_rune_auth_stage_three_tcp_users";
+  let kv = "/tmp/sigil_rune_auth_stage_three_tcp_kv";
+  remove_tree(&kv);
+  let code = match exercise_tcp(&users, &kv) {
+    Ok(value) => value,
+    Err(value) => value,
+  };
+  remove_tree(&users);
+  remove_tree(&kv);
+  return code;
+}

@@ -1,0 +1,156 @@
+module stage_three_tcp_support
+  targets server
+  trust none
+
+use stash.persistent.PersistentStore;
+use stash.persistent.StoreError;
+use stash.persistent.delete;
+use stash.persistent.get;
+use stash.persistent.put;
+use stash.protocol.ProtoError;
+use stash.protocol.Request;
+use stash.protocol.Response;
+use stash.protocol.kv_error_code;
+use stash.protocol.read_request;
+use stash.protocol.write_response;
+
+pub struct ServerCtx {
+  listener: TcpListener,
+  store: SyncShared<Lock<PersistentStore>>,
+  time_cell: SyncShared<Atomic<Int>>,
+}
+
+pub fn new_server_ctx(listener: TcpListener, store: SyncShared<Lock<PersistentStore>>, time_cell: SyncShared<Atomic<Int>>) -> ServerCtx
+  intent "Create ServerCtx"
+  requires none
+  ensures none
+  effects none
+{
+  return ServerCtx { listener: listener, store: store, time_cell: time_cell };
+}
+
+pub fn handle_persistent_request(store: &mut PersistentStore, req: Request, sample_time: fn() -> Option<Int>) -> Response
+  intent "Process one Request against a PersistentStore."
+  requires none
+  ensures none
+  effects of(sample_time), fs
+{
+  match req {
+    Request.Ping => {
+      return Response.Success;
+    }
+    Request.Get(key) => {
+      let res = get(&mut store, &key, sample_time);
+      return match res {
+        Ok(opt) => match opt {
+          Some(val) => Response.Value(val),
+          None => Response.NotFound,
+        },
+        Err(StoreError.Kv(err)) => Response.Error(kv_error_code(err), Bytes.new()),
+        Err(_) => Response.Error(14, Bytes.new()),
+      };
+    }
+    Request.Put(key, val, ttl) => {
+      let res = put(&mut store, &key, &val, ttl, sample_time);
+      return match res {
+        Ok(_) => Response.Success,
+        Err(StoreError.Kv(err)) => Response.Error(kv_error_code(err), Bytes.new()),
+        Err(_) => Response.Error(14, Bytes.new()),
+      };
+    }
+    Request.Delete(key) => {
+      let res = delete(&mut store, &key);
+      return match res {
+        Ok(_) => Response.Success,
+        Err(StoreError.Kv(err)) => Response.Error(kv_error_code(err), Bytes.new()),
+        Err(_) => Response.Error(14, Bytes.new()),
+      };
+    }
+  }
+}
+
+pub fn serve_persistent_stream(stream: &TcpStream, store: &SyncShared<Lock<PersistentStore>>, sample_time: fn() -> Option<Int>)
+  intent "Serve requests on a connection sequentially."
+  requires none
+  ensures none
+  effects of(sample_time), clock, fs, net.server, task
+{
+  while true {
+    let read_result = task.timeout(60000, || read_request(&stream));
+    let mut maybe_req = Err(ProtoError.Closed);
+    match read_result {
+      Some(r) => {
+        maybe_req = r;
+      }
+      None => {
+        return;
+      }
+    }
+    match maybe_req {
+      Err(ProtoError.Closed) => {
+        return;
+      }
+      Err(ProtoError.InvalidLength) => {
+        return;
+      }
+      Err(ProtoError.UnsupportedVersion) => {
+        return;
+      }
+      Err(ProtoError.UnknownOp) => {
+        let resp = Response.Error(1, Bytes.new());
+        let _ = task.timeout(60000, || write_response(&stream, &resp));
+      }
+      Err(ProtoError.InvalidPayload) => {
+        let resp = Response.Error(2, Bytes.new());
+        let _ = task.timeout(60000, || write_response(&stream, &resp));
+      }
+      Err(ProtoError.Other) => {
+        return;
+      }
+      Ok(req) => {
+        let lk = store.borrow();
+        let mut resp = Response.Error(14, Bytes.new());
+        match lk.acquire() {
+          Ok(g0) => {
+            let mut g = g0;
+            resp = handle_persistent_request(g.get_mut(), req, sample_time);
+          }
+          Err(_) => {}
+        }
+        let write_result = task.timeout(60000, || write_response(&stream, &resp));
+        match write_result {
+          Some(Ok(_)) => {}
+          _ => {
+            return;
+          }
+        }
+      }
+    }
+  }
+}
+
+pub fn serve_persistent(ctx: &ServerCtx)
+  intent "Accept a connection and serve it until closed."
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  match ctx.listener.accept() {
+    Ok(stream) => {
+      let cell = ctx.time_cell.clone();
+      let sample = move || {
+        let c = cell.borrow();
+        return Some(c.load());
+      };
+      serve_persistent_stream(&stream, &ctx.store, sample);
+    }
+    Err(_) => {}
+  }
+}
+
+pub fn abort_persistent(ctx: ServerCtx)
+  intent "Abort handler for server slot."
+  requires none
+  ensures none
+  effects none
+{}

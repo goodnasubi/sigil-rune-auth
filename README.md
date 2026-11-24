@@ -71,7 +71,7 @@ rune_cli <register|disable|bump-generation|set-password> --dir=<DB ディレク�
 
 ## 段 3　セッション
 
-`sigil/rune_sessions.sigil` は [ADR 0060][adr0060] 決定 2 のセッション管理を提供します。`stash.persistent` を専用ディレクトリに `require_ttl = true` で開き、サービスで一つの `PendingLogouts` を共有します。
+`sigil/rune_sessions.sigil` は [ADR 0060][adr0060] 決定 2 のセッション管理を提供します。`stash.persistent` を専用ディレクトリに `require_ttl = true` で開き、サービスで一つの `PendingLogouts` を共有します。`sigil/rune_sessions_tcp.sigil` は同じ操作を TCP 経由の KV クライアント（`stash.client`）を通じて行います。
 
 - `issue_session` にログイン成功時の利用者 ID と世代を渡します。既定の絶対寿命は 28,800 秒（8 時間）、指定可能な範囲は 300〜2,592,000 秒です。新しい 32 バイトの ID は永続化成功後に `Secret` で返ります。KV には、ID のハッシュから導いたキーと版 1 の固定長レコードを保存します。検証で寿命を延長する処理はありません。
 - `validate_session` は保留リスト、KV の TTL、レコードの期限、利用者の状態と世代を検査します。いずれかで失敗すると `None` を返します。発行と検証には Unix 秒を返す関数を渡します（運用時は `clock.unix_seconds`）。
@@ -80,7 +80,7 @@ rune_cli <register|disable|bump-generation|set-password> --dir=<DB ディレク�
 
 ## 検証
 
-Linux x86-64 で Git、Rustup、C リンカーを用意し、`scripts/check.sh` を実行します。Sigil のコンパイラ・埋め込み標準ライブラリ・ネイティブ核は同一のコミット `15beabc44aff08a0566abe3405d722e35b9b8aa5`、sigil-db 核は `9483e36f08c35bfc62b3beeb008a531887506037` を使用します（どちらも取得後にコミットと変更なしを確認します）。Rust は 1.100.0、依存クレートは同コミットの `Cargo.lock` で固定します。KV は段 2 の `7dfcf15b24251d80904f8d54e54b735652b89303` に固定します。スクリプトは Cargo の fmt と Clippy を実行し、固定した処理系の `sigil test --ct` で `Sigil.toml` に登録した導出鍵の照合関数を静的検査と CLIF 検査にかけます。同じ処理系の評価器とネイティブ出力で段 1〜3 の試験も実行します。段 3 の試験は永続 KV の期限境界、WAL 障害後の再試行と失効、世代変更と無効化を検査します。TCP 経由の試験は後続対応です。段 2 の試験は、抑制の境界（`stage_two_throttle_test`）、利用者表・ログイン・移行（`stage_two_users_test`）、中断・復旧（`stage_two_recovery_test`）、CLI（`stage_two_cli_test`）です。中断・復旧は、4 つの更新の全 I/O の関門を 3 通り（I/O 失敗・クラッシュ・書き込みの途中切れ）で中断し、再起動後の行が「完全に入った」か「まったく入っていない」かのどちらかであることと、一意索引と表が食い違わないことを確かめます。最後に、実行ファイルの引数・終了コード・出力を煙試験で確かめます。試験は PBKDF2 の反復回数を規則の下限 4096 にして時間を抑えています（煙試験の `register` 1 回だけ実運用の 100,000 回です）。
+Linux x86-64 で Git、Rustup、C リンカーを用意し、`scripts/check.sh` を実行します。Sigil のコンパイラ・埋め込み標準ライブラリ・ネイティブ核は同一のコミット `15beabc44aff08a0566abe3405d722e35b9b8aa5`、sigil-db 核は `9483e36f08c35bfc62b3beeb008a531887506037` を使用します（どちらも取得後にコミットと変更なしを確認します）。Rust は 1.100.0、依存クレートは同コミットの `Cargo.lock` で固定します。KV は段 3 の `860185225ca88beea5a1d45e6ebde94cc4c4162d`（ADR 0059 段 3 の TCP と Sigil クライアント）に固定します。スクリプトは Cargo の fmt と Clippy を実行し、固定した処理系の `sigil test --ct` で `Sigil.toml` に登録した導出鍵の照合関数を静的検査と CLIF 検査にかけます。同じ処理系の評価器とネイティブ出力で段 1〜3 の試験も実行します。段 3 の試験は永続 KV の期限境界、WAL 障害後の再試行と失効、世代変更と無効化を検査します。TCP 経由の試験（`sigil/stage_three_sessions_tcp_test.sigil`）では第 1 段として期限境界を検証します。段 2 の試験は、抑制の境界（`stage_two_throttle_test`）、利用者表・ログイン・移行（`stage_two_users_test`）、中断・復旧（`stage_two_recovery_test`）、CLI（`stage_two_cli_test`）です。中断・復旧は、4 つの更新の全 I/O の関門を 3 通り（I/O 失敗・クラッシュ・書き込みの途中切れ）で中断し、再起動後の行が「完全に入った」か「まったく入っていない」かのどちらかであることと、一意索引と表が食い違わないことを確かめます。最後に、実行ファイルの引数・終了コード・出力を煙試験で確かめます。試験は PBKDF2 の反復回数を規則の下限 4096 にして時間を抑えています（煙試験の `register` 1 回だけ実運用の 100,000 回です）。
 
 試験の固定値は Python 標準ライブラリの `hashlib.pbkdf2_hmac`、`hashlib.sha256`、`struct.pack`、`base64.urlsafe_b64encode`、`hmac.digest` で独立に算出しました。
 

@@ -1,0 +1,130 @@
+module rune_sessions_tcp
+  targets server
+  trust none
+
+use rune_auth.decode_session;
+use rune_auth.encode_session;
+use rune_auth.new_session_id;
+use rune_auth.session_key;
+use rune_sessions.LogoutOutcome;
+use rune_sessions.PendingLogouts;
+use rune_sessions.SessionError;
+use rune_users.UserStore;
+use rune_users.lookup_user_by_id;
+use rune_users.status_active;
+use stash.client.Client;
+use stash.client.delete;
+use stash.client.get;
+use stash.client.put;
+use stash.memory.Ttl;
+
+fn is_pending(pending: &PendingLogouts, key: &Bytes) -> Bool
+  intent "照合"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < pending.keys.len() {
+    if pending.keys.get(i) == Some(&key) {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+pub fn issue_session(client: &mut Client, user_id: &Bytes, generation: Int, lifetime: Int, sample_time: fn() -> Option<Int>) -> Result<Secret, SessionError>
+  intent "ログイン成功時の利用者 ID と世代から新しいセッションを発行し、TCP 経由の KV 永続化成功後にだけ資格を返す"
+  requires none
+  ensures none
+  effects of(sample_time), net.client, random, task.suspend
+{
+  if lifetime < 300 || lifetime > 2592000 {
+    return Err(SessionError.InvalidLifetime);
+  }
+  let now = sample_time().unwrap_or(-1);
+  if now < 0 || now > 9223372036854775807 - lifetime {
+    return Err(SessionError.ClockUnavailable);
+  }
+  let record = encode_session(&user_id, generation, now, now + lifetime).ok_or(SessionError.InvalidUser)?;
+  let id = new_session_id().ok_or(SessionError.EntropyUnavailable)?;
+  let key = session_key(&id).ok_or(SessionError.EntropyUnavailable)?;
+  return match put(&mut client, &key, &record, Ttl.Seconds(lifetime)) {
+    Ok(_) => Ok(Secret.from_bytes(id)),
+    Err(_) => Err(SessionError.StorageUnavailable),
+  };
+}
+
+pub fn validate_session(client: &mut Client, users: &mut UserStore, pending: &PendingLogouts, id: &Secret, sample_time: fn() -> Option<Int>) -> Option<Bytes>
+  intent "期限内で有効な利用者の現世代に属するセッションだけから利用者 ID を返す（TCP 経由）"
+  requires none
+  ensures none
+  effects of(sample_time), fs, net.client, task.suspend
+{
+  let key = session_key(&id.expose())?;
+  if is_pending(&pending, &key) {
+    return None;
+  }
+  let now = sample_time()?;
+  let record = match get(&mut client, &key) {
+    Ok(Some(value)) => decode_session(&value),
+    _ => None,
+  }?;
+  if now < record.issued_at() || now >= record.expires_at() {
+    return None;
+  }
+  let user_id = record.user_id();
+  match lookup_user_by_id(&mut users, &user_id) {
+    Ok(Some(row)) => {
+      if row.row_status == status_active() && row.row_generation == record.generation() {
+        return Some(user_id);
+      }
+    }
+    _ => {}
+  }
+  return None;
+}
+
+pub fn logout_session(client: &mut Client, pending: &mut PendingLogouts, id: &Secret) -> LogoutOutcome
+  intent "TCP 経由の DELETE 成功で失効を確定する"
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let derived = session_key(&id.expose());
+  if derived.is_none() {
+    return LogoutOutcome.Complete;
+  }
+  let key = derived.unwrap_or(Bytes.new());
+  if delete(&mut client, &key).is_ok() {
+    return LogoutOutcome.Complete;
+  }
+  if !is_pending(&pending, &key) {
+    pending.keys.push(key);
+  }
+  return LogoutOutcome.Unavailable;
+}
+
+pub fn retry_pending_logouts(client: &mut Client, pending: &mut PendingLogouts) -> Int
+  intent "TCP 経由で未確定の DELETE を各キーにつき一度試し、残った件数を返す"
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let mut remaining = List.new();
+  let mut i = 0;
+  while i < pending.keys.len() {
+    match pending.keys.get(i) {
+      Some(key) => {
+        if delete(&mut client, &key).is_err() {
+          remaining.push(key.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  pending.keys = remaining;
+  return pending.keys.len();
+}
