@@ -119,6 +119,28 @@ fn make_spray_req(user_num: Int, ip: &String) -> Option<HttpRequest>
   return parse_raw_request(&wire_str);
 }
 
+fn ip_or_empty(ip: Option<String>) -> String
+  intent "接続元 IP を取り出す。None（信頼プロキシ経由で X-Forwarded-For が使えない）は空文字列にする"
+  requires none
+  ensures none
+  effects none
+{
+  return match ip {
+    Some(s) => s,
+    None => "",
+  };
+}
+
+fn logout_with_content_type(ct: &String) -> Option<HttpRequest>
+  intent "Content-Type だけを変えた POST /auth/logout の要求を組み立てる（Cookie なし・本文なし）"
+  requires none
+  ensures none
+  effects none
+{
+  let wire = concat3(&"POST /auth/logout HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: ", &ct, &"\r\nContent-Length: 0\r\n\r\n");
+  return parse_raw_request(&wire);
+}
+
 fn header_value(resp: &HttpResponse, name: &String) -> Option<String>
   intent "指定した見出しの値を文字列で返す"
   requires none
@@ -275,7 +297,9 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
   }?;
 
   let now_fn = move || Some(2000);
+  // 信頼プロキシ経由（remote_proxy。X-Forwarded-For が要る）と、プロキシを介さない直接の接続（remote_direct）。
   let remote_proxy = "127.0.0.1";
+  let remote_direct = "198.51.100.1";
 
   // 3. 正常系フロー: ログイン
   let login_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 55\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\"}";
@@ -283,7 +307,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(6),
   }?;
-  let login_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req, &remote_proxy, now_fn);
+  let login_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req, &remote_direct, now_fn);
   if login_resp.status() != 200 {
     return Err(7);
   }
@@ -301,7 +325,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(10),
   }?;
-  let login_resp2 = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req2, &remote_proxy, now_fn);
+  let login_resp2 = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req2, &remote_direct, now_fn);
   let cookie_hdr2 = match header_value(&login_resp2, &"set-cookie") {
     Some(h) => Ok(h),
     None => Err(11),
@@ -316,7 +340,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(13),
   }?;
-  let fix_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &fix_req, &remote_proxy, now_fn);
+  let fix_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &fix_req, &remote_direct, now_fn);
   let fix_cookie_hdr = match header_value(&fix_resp, &"set-cookie") {
     Some(h) => Ok(h),
     None => Err(14),
@@ -331,7 +355,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(16),
   }?;
-  let sess_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &sess_req, &remote_proxy, now_fn);
+  let sess_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &sess_req, &remote_direct, now_fn);
   if sess_resp.status() != 200 {
     return Err(17);
   }
@@ -350,7 +374,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(20),
   }?;
-  let tok_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &tok_req, &remote_proxy, now_fn);
+  let tok_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &tok_req, &remote_direct, now_fn);
   if tok_resp.status() != 200 {
     return Err(21);
   }
@@ -382,24 +406,24 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(26),
   }?;
-  let bad_aud_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_aud_req, &remote_proxy, now_fn);
+  let bad_aud_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_aud_req, &remote_direct, now_fn);
   if bad_aud_resp.status() != 403 {
     return Err(27);
   }
 
   // 8. 世代更新による全セッション失効
   let _ = bump_generation(&mut users, &"alice".as_bytes());
-  let expired_sess_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &sess_req, &remote_proxy, now_fn);
+  let expired_sess_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &sess_req, &remote_direct, now_fn);
   if expired_sess_resp.status() != 401 {
     return Err(28);
   }
-  let expired_tok_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &tok_req, &remote_proxy, now_fn);
+  let expired_tok_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &tok_req, &remote_direct, now_fn);
   if expired_tok_resp.status() != 401 {
     return Err(29);
   }
 
   // 9. Alice で再ログインして新しいセッションを取得し、ログアウトを検証
-  let login_resp3 = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req, &remote_proxy, now_fn);
+  let login_resp3 = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req, &remote_direct, now_fn);
   let cookie_hdr3 = match header_value(&login_resp3, &"set-cookie") {
     Some(h) => Ok(h),
     None => Err(30),
@@ -414,7 +438,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(32),
   }?;
-  let logout_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &logout_req, &remote_proxy, now_fn);
+  let logout_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &logout_req, &remote_direct, now_fn);
   if logout_resp.status() != 200 {
     return Err(33);
   }
@@ -432,7 +456,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(36),
   }?;
-  let post_logout_sess = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &sess_req3, &remote_proxy, now_fn);
+  let post_logout_sess = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &sess_req3, &remote_direct, now_fn);
   if post_logout_sess.status() != 401 {
     return Err(37);
   }
@@ -444,7 +468,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(38),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &no_orig_req, &remote_proxy, now_fn).status() != 403 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &no_orig_req, &remote_direct, now_fn).status() != 403 {
     return Err(39);
   }
 
@@ -454,7 +478,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(40),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &fake_orig_req, &remote_proxy, now_fn).status() != 403 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &fake_orig_req, &remote_direct, now_fn).status() != 403 {
     return Err(41);
   }
 
@@ -464,7 +488,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(42),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &no_ct_req, &remote_proxy, now_fn).status() != 400 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &no_ct_req, &remote_direct, now_fn).status() != 400 {
     return Err(43);
   }
 
@@ -474,7 +498,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(44),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_ct_req, &remote_proxy, now_fn).status() != 400 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_ct_req, &remote_direct, now_fn).status() != 400 {
     return Err(45);
   }
 
@@ -484,21 +508,21 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(46),
   }?;
-  let ghost_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &ghost_req, &remote_proxy, now_fn);
+  let ghost_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &ghost_req, &remote_direct, now_fn);
 
   let wrong_pass_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 52\r\n\r\n{\"username\":\"alice\",\"password\":\"wrong password 123\"}";
   let wrong_pass_req = match parse_raw_request(&wrong_pass_wire) {
     Some(r) => Ok(r),
     None => Err(47),
   }?;
-  let wrong_pass_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &wrong_pass_req, &remote_proxy, now_fn);
+  let wrong_pass_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &wrong_pass_req, &remote_direct, now_fn);
 
   let disabled_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 57\r\n\r\n{\"username\":\"bob..\",\"password\":\"another secret password\"}";
   let disabled_req = match parse_raw_request(&disabled_wire) {
     Some(r) => Ok(r),
     None => Err(48),
   }?;
-  let disabled_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &disabled_req, &remote_proxy, now_fn);
+  let disabled_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &disabled_req, &remote_direct, now_fn);
 
   if ghost_resp.status() != 401 || wrong_pass_resp.status() != 401 || disabled_resp.status() != 401 {
     return Err(49);
@@ -522,7 +546,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
 
   // 12. 同時 PBKDF2 制限
   service.active_pbkdf2 = 4;
-  let limited_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req, &remote_proxy, now_fn);
+  let limited_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req, &remote_direct, now_fn);
   service.active_pbkdf2 = 0;
   if limited_resp.status() != 429 {
     return Err(54);
@@ -535,7 +559,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(55),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_json_req, &remote_proxy, now_fn).status() != 400 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_json_req, &remote_direct, now_fn).status() != 400 {
     return Err(56);
   }
 
@@ -545,7 +569,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(57),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &extra_key_req, &remote_proxy, now_fn).status() != 400 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &extra_key_req, &remote_direct, now_fn).status() != 400 {
     return Err(58);
   }
 
@@ -555,7 +579,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(59),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &short_pass_req, &remote_proxy, now_fn).status() != 400 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &short_pass_req, &remote_direct, now_fn).status() != 400 {
     return Err(60);
   }
 
@@ -565,7 +589,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(61),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_user_req, &remote_proxy, now_fn).status() != 400 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &bad_user_req, &remote_direct, now_fn).status() != 400 {
     return Err(62);
   }
 
@@ -584,11 +608,11 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(65),
   }?;
-  let client_ip_trusted = extract_client_ip(&xff_req, &"127.0.0.1", &service.config.trusted_proxies);
+  let client_ip_trusted = ip_or_empty(extract_client_ip(&xff_req, &"127.0.0.1", &service.config.trusted_proxies));
   if client_ip_trusted != "203.0.113.195" {
     return Err(66);
   }
-  let client_ip_untrusted = extract_client_ip(&xff_req, &"198.51.100.1", &service.config.trusted_proxies);
+  let client_ip_untrusted = ip_or_empty(extract_client_ip(&xff_req, &"198.51.100.1", &service.config.trusted_proxies));
   if client_ip_untrusted != "198.51.100.1" {
     return Err(67);
   }
@@ -601,7 +625,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(68),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &large_req, &remote_proxy, now_fn).status() != 413 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &large_req, &remote_direct, now_fn).status() != 413 {
     return Err(69);
   }
 
@@ -611,7 +635,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(70),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &method_req1, &remote_proxy, now_fn).status() != 405 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &method_req1, &remote_direct, now_fn).status() != 405 {
     return Err(71);
   }
 
@@ -620,7 +644,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(72),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &method_req2, &remote_proxy, now_fn).status() != 405 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &method_req2, &remote_direct, now_fn).status() != 405 {
     return Err(73);
   }
 
@@ -630,7 +654,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(74),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &not_found_req, &remote_proxy, now_fn).status() != 404 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &not_found_req, &remote_direct, now_fn).status() != 404 {
     return Err(75);
   }
 
@@ -640,7 +664,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(76),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &dup_key_req, &remote_proxy, now_fn).status() != 400 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &dup_key_req, &remote_direct, now_fn).status() != 400 {
     return Err(77);
   }
 
@@ -650,7 +674,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(78),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &token_no_orig_req, &remote_proxy, now_fn).status() != 403 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &token_no_orig_req, &remote_direct, now_fn).status() != 403 {
     return Err(79);
   }
 
@@ -659,7 +683,7 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
     Some(r) => Ok(r),
     None => Err(80),
   }?;
-  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &token_bad_ct_req, &remote_proxy, now_fn).status() != 400 {
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &token_bad_ct_req, &remote_direct, now_fn).status() != 400 {
     return Err(81);
   }
 
@@ -736,6 +760,67 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
   let ip_c_blocked = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &ip_c_blocked_req, &remote_proxy, now_fn);
   if ip_c_blocked.status() != 429 {
     return Err(95);
+  }
+
+  // 22. Content-Type の厳密な照合（application/json の後ろは終端か ; だけ。大文字小文字は区別しない）
+  let mut bad_types = List.new();
+  bad_types.push("application/jsonx");
+  bad_types.push("application/json-patch+json");
+  bad_types.push("application/json/x");
+  let mut ct_i = 0;
+  while ct_i < bad_types.len() {
+    let ct = match bad_types.get(ct_i) {
+      Some(c) => c.clone(),
+      None => "",
+    };
+    let req = match logout_with_content_type(&ct) {
+      Some(r) => Ok(r),
+      None => Err(96),
+    }?;
+    if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &req, &remote_direct, now_fn).status() != 400 {
+      return Err(97);
+    }
+    ct_i = ct_i + 1;
+  }
+  let mut good_types = List.new();
+  good_types.push("application/json");
+  good_types.push("APPLICATION/JSON");
+  good_types.push("application/json;charset=utf-8");
+  good_types.push("application/json ; charset=utf-8");
+  let mut ok_i = 0;
+  while ok_i < good_types.len() {
+    let ct = match good_types.get(ok_i) {
+      Some(c) => c.clone(),
+      None => "",
+    };
+    let req = match logout_with_content_type(&ct) {
+      Some(r) => Ok(r),
+      None => Err(98),
+    }?;
+    if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &req, &remote_direct, now_fn).status() != 200 {
+      return Err(99);
+    }
+    ok_i = ok_i + 1;
+  }
+
+  // 23. 信頼プロキシ経由で X-Forwarded-For が使えない要求は 400（全利用者が 1 つの IP 抑制を共有しないため）
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &login_req, &remote_proxy, now_fn).status() != 400 {
+    return Err(100);
+  }
+  let empty_xff_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nX-Forwarded-For: ,\r\nContent-Length: 55\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\"}";
+  let empty_xff_req = match parse_raw_request(&empty_xff_wire) {
+    Some(r) => Ok(r),
+    None => Err(101),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &empty_xff_req, &remote_proxy, now_fn).status() != 400 {
+    return Err(102);
+  }
+  // プロキシを介さない直接の接続は、X-Forwarded-For が無くても接続元 IP で受け付ける。
+  if ip_or_empty(extract_client_ip(&login_req, &"198.51.100.1", &service.config.trusted_proxies)) != "198.51.100.1" {
+    return Err(103);
+  }
+  if ip_or_empty(extract_client_ip(&login_req, &"127.0.0.1", &service.config.trusted_proxies)) != "" {
+    return Err(104);
   }
 
   let _ = close_persistent(kv);
