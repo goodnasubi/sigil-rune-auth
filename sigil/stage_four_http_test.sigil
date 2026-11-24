@@ -4,6 +4,7 @@ module stage_four_http_test
 
 use rune_auth.user_subject;
 use rune_http.AuthEvent;
+use rune_http.decimal;
 use rune_http.extract_client_ip;
 use rune_http.handle_auth_request;
 use rune_http.log_event_text;
@@ -78,6 +79,44 @@ fn concat3(a: &String, b: &String, c: &String) -> String
   bytes.extend(&b.as_bytes());
   bytes.extend(&c.as_bytes());
   return bytes.to_string_utf8().unwrap_or("");
+}
+
+fn repeat_char(c: Int, count: Int) -> String
+  intent "同じ文字を count 個並べた文字列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.new();
+  let mut i = 0;
+  while i < count {
+    bytes.push(c);
+    i = i + 1;
+  }
+  return bytes.to_string_utf8().unwrap_or("");
+}
+
+fn make_spray_req(user_num: Int, ip: &String) -> Option<HttpRequest>
+  intent "スプレー試験用の HttpRequest を組み立てる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut body = Bytes.new();
+  body.extend(&"{\"username\":\"spray_".as_bytes());
+  body.extend(&decimal(user_num).as_bytes());
+  body.extend(&"\",\"password\":\"wrong password 123\"}".as_bytes());
+  let body_len_str = decimal(body.byte_len());
+
+  let mut wire = Bytes.new();
+  wire.extend(&"POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nX-Forwarded-For: ".as_bytes());
+  wire.extend(&ip.as_bytes());
+  wire.extend(&"\r\nContent-Length: ".as_bytes());
+  wire.extend(&body_len_str.as_bytes());
+  wire.extend(&"\r\n\r\n".as_bytes());
+  wire.extend(&body);
+  let wire_str = wire.to_string_utf8().unwrap_or("");
+  return parse_raw_request(&wire_str);
 }
 
 fn header_value(resp: &HttpResponse, name: &String) -> Option<String>
@@ -552,6 +591,151 @@ fn test_http_service(users_dir: &String, kv_dir: &String) -> Result<Int, Int>
   let client_ip_untrusted = extract_client_ip(&xff_req, &"198.51.100.1", &service.config.trusted_proxies);
   if client_ip_untrusted != "198.51.100.1" {
     return Err(67);
+  }
+
+  // 16. 本文上限超過（413 Payload Too Large）
+  // 既定の max_body_bytes (4096) を超える 4097 バイトの本文
+  let large_body = repeat_char(97, 4097);
+  let large_wire = concat3(&"POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 4097\r\n\r\n", &large_body, &"");
+  let large_req = match parse_raw_request(&large_wire) {
+    Some(r) => Ok(r),
+    None => Err(68),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &large_req, &remote_proxy, now_fn).status() != 413 {
+    return Err(69);
+  }
+
+  // 17. 405 Method Not Allowed
+  let method_wire1 = "GET /auth/login HTTP/1.1\r\nHost: auth.example.com\r\n\r\n";
+  let method_req1 = match parse_raw_request(&method_wire1) {
+    Some(r) => Ok(r),
+    None => Err(70),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &method_req1, &remote_proxy, now_fn).status() != 405 {
+    return Err(71);
+  }
+
+  let method_wire2 = concat3(&"POST /auth/session HTTP/1.1\r\nHost: auth.example.com\r\nCookie: ", &session_cookie_pair, &"\r\nContent-Length: 0\r\n\r\n");
+  let method_req2 = match parse_raw_request(&method_wire2) {
+    Some(r) => Ok(r),
+    None => Err(72),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &method_req2, &remote_proxy, now_fn).status() != 405 {
+    return Err(73);
+  }
+
+  // 18. 404 Not Found
+  let not_found_wire = "GET /auth/unknown HTTP/1.1\r\nHost: auth.example.com\r\n\r\n";
+  let not_found_req = match parse_raw_request(&not_found_wire) {
+    Some(r) => Ok(r),
+    None => Err(74),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &not_found_req, &remote_proxy, now_fn).status() != 404 {
+    return Err(75);
+  }
+
+  // 19. キー重複の拒否 (400 Bad Request)
+  let dup_key_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nContent-Length: 74\r\n\r\n{\"username\":\"alice\",\"username\":\"alice\",\"password\":\"correct horse battery\"}";
+  let dup_key_req = match parse_raw_request(&dup_key_wire) {
+    Some(r) => Ok(r),
+    None => Err(76),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &dup_key_req, &remote_proxy, now_fn).status() != 400 {
+    return Err(77);
+  }
+
+  // 20. CSRF 検査の個別ケース（POST /auth/token での Origin なし 403・Content-Type 不正 400）
+  let token_no_orig_wire = concat3(&"POST /auth/token HTTP/1.1\r\nHost: auth.example.com\r\nContent-Type: application/json\r\nCookie: ", &session_cookie_pair, &"\r\nContent-Length: 24\r\n\r\n{\"audience\":\"sigil.api\"}");
+  let token_no_orig_req = match parse_raw_request(&token_no_orig_wire) {
+    Some(r) => Ok(r),
+    None => Err(78),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &token_no_orig_req, &remote_proxy, now_fn).status() != 403 {
+    return Err(79);
+  }
+
+  let token_bad_ct_wire = concat3(&"POST /auth/token HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: text/plain\r\nCookie: ", &session_cookie_pair, &"\r\nContent-Length: 24\r\n\r\n{\"audience\":\"sigil.api\"}");
+  let token_bad_ct_req = match parse_raw_request(&token_bad_ct_wire) {
+    Some(r) => Ok(r),
+    None => Err(80),
+  }?;
+  if handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &token_bad_ct_req, &remote_proxy, now_fn).status() != 400 {
+    return Err(81);
+  }
+
+  // 21. 接続元 IP 抑制（5回失敗で 429、X-Forwarded-For 別の IP が独立に数えられること、成功で IP 抑制がリセットされないこと）
+  // 異なる利用者名へのパスワードスプレー攻撃を模し、利用者抑制ではなく IP 抑制が働くことを検証する
+  let mut spray_i = 1;
+  while spray_i <= 5 {
+    let req = match make_spray_req(spray_i, &"198.51.100.10") {
+      Some(r) => Ok(r),
+      None => Err(82),
+    }?;
+    let r = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &req, &remote_proxy, now_fn);
+    if r.status() != 401 {
+      return Err(83);
+    }
+    spray_i = spray_i + 1;
+  }
+  // 6回目: IP A は 429 Too Many Requests
+  let ip_a_blocked_req = match make_spray_req(6, &"198.51.100.10") {
+    Some(r) => Ok(r),
+    None => Err(84),
+  }?;
+  let ip_a_blocked = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &ip_a_blocked_req, &remote_proxy, now_fn);
+  if ip_a_blocked.status() != 429 {
+    return Err(85);
+  }
+
+  // 別の IP B (198.51.100.11) は影響を受けず 401 になる（独立に数えられること）
+  let ip_b_req = match make_spray_req(100, &"198.51.100.11") {
+    Some(r) => Ok(r),
+    None => Err(86),
+  }?;
+  let ip_b_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &ip_b_req, &remote_proxy, now_fn);
+  if ip_b_resp.status() != 401 {
+    return Err(87);
+  }
+
+  // IP C (198.51.100.12): 4回失敗後に正しいパスワードで成功しても IP 失敗カウントは巻き戻らない (P1 の検証)
+  let mut c_i = 201;
+  while c_i <= 204 {
+    let req = match make_spray_req(c_i, &"198.51.100.12") {
+      Some(r) => Ok(r),
+      None => Err(88),
+    }?;
+    let r = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &req, &remote_proxy, now_fn);
+    if r.status() != 401 {
+      return Err(89);
+    }
+    c_i = c_i + 1;
+  }
+  // 成功ログイン
+  let ip_c_succ_wire = "POST /auth/login HTTP/1.1\r\nHost: auth.example.com\r\nOrigin: https://auth.example.com\r\nContent-Type: application/json\r\nX-Forwarded-For: 198.51.100.12\r\nContent-Length: 55\r\n\r\n{\"username\":\"alice\",\"password\":\"correct horse battery\"}";
+  let ip_c_succ_req = match parse_raw_request(&ip_c_succ_wire) {
+    Some(r) => Ok(r),
+    None => Err(90),
+  }?;
+  let ip_c_succ_resp = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &ip_c_succ_req, &remote_proxy, now_fn);
+  if ip_c_succ_resp.status() != 200 {
+    return Err(91);
+  }
+  // その後の1回の失敗で合計5回となり、次は 429 になる（成功で IP 失敗数が 0 に巻き戻らないことの証明）
+  let ip_c_fail5_req = match make_spray_req(205, &"198.51.100.12") {
+    Some(r) => Ok(r),
+    None => Err(92),
+  }?;
+  let ip_c_fail5 = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &ip_c_fail5_req, &remote_proxy, now_fn);
+  if ip_c_fail5.status() != 401 {
+    return Err(93);
+  }
+  let ip_c_blocked_req = match make_spray_req(206, &"198.51.100.12") {
+    Some(r) => Ok(r),
+    None => Err(94),
+  }?;
+  let ip_c_blocked = handle_auth_request(&mut service, &mut users, &mut gate, &mut kv, &mut pending, &ip_c_blocked_req, &remote_proxy, now_fn);
+  if ip_c_blocked.status() != 429 {
+    return Err(95);
   }
 
   let _ = close_persistent(kv);

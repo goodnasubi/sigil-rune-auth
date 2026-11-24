@@ -19,7 +19,6 @@ use rune_throttle.Throttle;
 use rune_throttle.lock_remaining;
 use rune_throttle.new_throttle;
 use rune_throttle.record_failure;
-use rune_throttle.record_success;
 use rune_throttle.throttle_key;
 use rune_users.UserStore;
 use stash.persistent.PersistentStore;
@@ -513,6 +512,37 @@ fn check_no_unknown_keys(fields: &List<JsonField>, allowed: &List<String>) -> Bo
   return true;
 }
 
+fn check_no_duplicate_keys(fields: &List<JsonField>) -> Bool
+  intent "JSON オブジェクト内のキー重複を拒否する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < fields.len() {
+    match fields.get(i) {
+      Some(f1) => {
+        let name1 = f1.name();
+        let mut j = i + 1;
+        while j < fields.len() {
+          match fields.get(j) {
+            Some(f2) => {
+              if f2.name() == name1 {
+                return false;
+              }
+            }
+            None => {}
+          }
+          j = j + 1;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
 fn is_valid_username_char(c: Int) -> Bool
   intent "利用者名の文字種 [a-z0-9._@-] を判定する"
   requires none
@@ -611,7 +641,7 @@ fn handle_login(service: &mut HttpService, users: &mut UserStore, gate: &mut Log
   let mut allowed = List.new();
   allowed.push("username");
   allowed.push("password");
-  if !check_no_unknown_keys(&fields, &allowed) {
+  if !check_no_unknown_keys(&fields, &allowed) || !check_no_duplicate_keys(&fields) {
     return fixed_bad_request();
   }
 
@@ -660,6 +690,7 @@ fn handle_login(service: &mut HttpService, users: &mut UserStore, gate: &mut Log
     return fixed_too_many_requests(ip_wait);
   }
 
+  // 同時 PBKDF2 数上限の検査（段 4 では逐次同期実行のため未実装。カウンタ境界のみ提供・試験）
   if service.active_pbkdf2 >= service.config.max_concurrent_pbkdf2 {
     return fixed_too_many_requests(1);
   }
@@ -681,7 +712,7 @@ fn handle_login(service: &mut HttpService, users: &mut UserStore, gate: &mut Log
       return fixed_unauthorized();
     }
     Ok(LoginOutcome.Success(user_id, generation)) => {
-      record_success(&mut service.ip_throttle, &ip_key, now);
+      // ログイン成功時に IP の失敗数はリセットしない（パスワードスプレー対策。窓の経過でのみ解除）
       match issue_session(&mut kv, &user_id, generation, service.config.session_lifetime, sample_time) {
         Err(_) => {
           return fixed_internal_error();
@@ -735,7 +766,7 @@ fn handle_logout(service: &mut HttpService, kv: &mut PersistentStore, pending: &
       }
     }
     let allowed = List.new();
-    if !check_no_unknown_keys(&fields, &allowed) {
+    if !check_no_unknown_keys(&fields, &allowed) || !check_no_duplicate_keys(&fields) {
       return fixed_bad_request();
     }
   }
@@ -852,7 +883,7 @@ fn handle_token(service: &HttpService, kv: &mut PersistentStore, users: &mut Use
 
   let mut allowed = List.new();
   allowed.push("audience");
-  if !check_no_unknown_keys(&fields, &allowed) {
+  if !check_no_unknown_keys(&fields, &allowed) || !check_no_duplicate_keys(&fields) {
     return fixed_bad_request();
   }
 
