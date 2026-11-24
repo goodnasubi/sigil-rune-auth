@@ -1,0 +1,130 @@
+module rune_sessions_persistent
+  targets server
+  trust none
+
+use rune_auth.decode_session;
+use rune_auth.encode_session;
+use rune_auth.new_session_id;
+use rune_auth.session_key;
+use rune_sessions.LogoutOutcome;
+use rune_sessions.PendingLogouts;
+use rune_sessions.SessionError;
+use rune_users.UserStore;
+use rune_users.lookup_user_by_id;
+use rune_users.status_active;
+use stash.memory.Ttl;
+use stash.persistent.PersistentStore;
+use stash.persistent.delete;
+use stash.persistent.get;
+use stash.persistent.put;
+
+pub fn issue_session(kv: &mut PersistentStore, user_id: &Bytes, generation: Int, lifetime: Int, sample_time: fn() -> Option<Int>) -> Result<Secret, SessionError>
+  intent "ログイン成功時の利用者 ID と世代から新しいセッションを発行し、永続化成功後にだけ資格を返す"
+  requires none
+  ensures none
+  effects of(sample_time), fs, random
+{
+  if lifetime < 300 || lifetime > 2592000 {
+    return Err(SessionError.InvalidLifetime);
+  }
+  let now = sample_time().unwrap_or(-1);
+  if now < 0 || now > 9223372036854775807 - lifetime {
+    return Err(SessionError.ClockUnavailable);
+  }
+  let record = encode_session(&user_id, generation, now, now + lifetime).ok_or(SessionError.InvalidUser)?;
+  let id = new_session_id().ok_or(SessionError.EntropyUnavailable)?;
+  let key = session_key(&id).ok_or(SessionError.EntropyUnavailable)?;
+  return match put(&mut kv, &key, &record, Ttl.Seconds(lifetime), move || Some(now)) {
+    Ok(_) => Ok(Secret.from_bytes(id)),
+    Err(_) => Err(SessionError.StorageUnavailable),
+  };
+}
+
+fn is_pending(pending: &PendingLogouts, key: &Bytes) -> Bool
+  intent "失効の成否が未確定のハッシュキーを照合する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < pending.keys.len() {
+    if pending.keys.get(i) == Some(&key) {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+pub fn validate_session(kv: &mut PersistentStore, users: &mut UserStore, pending: &PendingLogouts, id: &Secret, sample_time: fn() -> Option<Int>) -> Option<Bytes>
+  intent "期限内で有効な利用者の現世代に属するセッションだけから利用者 ID を返す"
+  requires none
+  ensures none
+  effects of(sample_time), fs
+{
+  let key = session_key(&id.expose())?;
+  if is_pending(&pending, &key) {
+    return None;
+  }
+  let now = sample_time()?;
+  let record = match get(&mut kv, &key, move || Some(now)) {
+    Ok(Some(value)) => decode_session(&value),
+    _ => None,
+  }?;
+  if now < record.issued_at() || now >= record.expires_at() {
+    return None;
+  }
+  let user_id = record.user_id();
+  match lookup_user_by_id(&mut users, &user_id) {
+    Ok(Some(row)) => {
+      if row.row_status == status_active() && row.row_generation == record.generation() {
+        return Some(user_id);
+      }
+    }
+    _ => {}
+  }
+  return None;
+}
+
+pub fn retry_pending_logouts(kv: &mut PersistentStore, pending: &mut PendingLogouts) -> Int
+  intent "未確定の DELETE を各キーにつき一度試し、残った件数を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut remaining = List.new();
+  let mut i = 0;
+  while i < pending.keys.len() {
+    match pending.keys.get(i) {
+      Some(key) => {
+        if delete(&mut kv, &key).is_err() {
+          remaining.push(key.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  pending.keys = remaining;
+  return pending.keys.len();
+}
+
+pub fn logout_session(kv: &mut PersistentStore, pending: &mut PendingLogouts, id: &Secret) -> LogoutOutcome
+  intent "DELETE の成功で失効を確定する。Unavailable は 503 に対応し、どちらの結果にも cookie の削除指示を付ける"
+  requires none
+  ensures none
+  effects fs
+{
+  let derived = session_key(&id.expose());
+  if derived.is_none() {
+    return LogoutOutcome.Complete;
+  }
+  let key = derived.unwrap_or(Bytes.new());
+  if delete(&mut kv, &key).is_ok() {
+    return LogoutOutcome.Complete;
+  }
+  if !is_pending(&pending, &key) {
+    pending.keys.push(key);
+  }
+  return LogoutOutcome.Unavailable;
+}

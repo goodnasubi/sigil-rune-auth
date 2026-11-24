@@ -4,7 +4,7 @@ set -euo pipefail
 sigil_sha=15beabc44aff08a0566abe3405d722e35b9b8aa5
 # sigil-db 核（ADR 0045）。段 2 は db/ の型付き関係 API とトランザクション API だけを使う。
 sigil_db_sha=9483e36f08c35bfc62b3beeb008a531887506037
-stash_sha=7dfcf15b24251d80904f8d54e54b735652b89303
+stash_sha=860185225ca88beea5a1d45e6ebde94cc4c4162d
 rust_version=1.100.0
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 scratch=$(mktemp -d)
@@ -55,7 +55,7 @@ root="$scratch/root"
 mkdir -p "$root"
 cp -R "$db_root/db" "$root/db"
 mkdir -p "$root/stash"
-cp "$stash_root"/stash/{memory,persistent}.sigil "$root/stash/"
+cp "$stash_root"/stash/*.sigil "$root/stash/"
 cp "$repo_root"/sigil/*.sigil "$root/"
 # CLIF の子プロセスも --root 直下のマニフェストを読む。
 cp "$repo_root/Sigil.toml" "$root/"
@@ -86,6 +86,7 @@ run_entry stage_two_users_test "Stage 2 users and login"
 run_entry stage_two_recovery_test "Stage 2 interruption and recovery"
 run_entry stage_two_cli_test "Stage 2 CLI commands"
 run_entry stage_three_sessions_test "Stage 3 persistent sessions"
+run_entry stage_three_tcp_sessions_test "Stage 3 TCP persistent sessions"
 
 # Smoke test of the real command line: argument reading, exit codes and the output of the native executable.
 # The one `register` below uses the full 100,000 iterations of the production setting.
