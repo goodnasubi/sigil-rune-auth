@@ -371,45 +371,54 @@ fn is_trusted_proxy(trusted: &List<String>, remote: &String) -> Bool
   return false;
 }
 
-pub fn extract_client_ip(req: &HttpRequest, remote_addr: &String, trusted_proxies: &List<String>) -> String
-  intent "信頼プロキシからの接続時は X-Forwarded-For を参照し、それ以外は接続元 IP を返す"
+pub fn extract_client_ip(req: &HttpRequest, remote_addr: &String, trusted_proxies: &List<String>) -> Option<String>
+  intent "信頼プロキシからの接続時は X-Forwarded-For の最後の値を返し（無い・空・読めないときは None）、それ以外は接続元 IP を返す"
   requires none
   ensures none
   effects none
 {
   if !is_trusted_proxy(&trusted_proxies, &remote_addr) {
-    return remote_addr.clone();
+    return Some(remote_addr.clone());
   }
-  match req.header(&"x-forwarded-for") {
-    None => {
-      return remote_addr.clone();
-    }
-    Some(raw_header) => {
-      let len = raw_header.byte_len();
-      if len == 0 {
-        return remote_addr.clone();
-      }
-      let mut end = len;
-      while end > 0 && (raw_header.get(end - 1).unwrap_or(0) == 32 || raw_header.get(end - 1).unwrap_or(0) == 9) {
-        end = end - 1;
-      }
-      let mut start = end;
-      while start > 0 && raw_header.get(start - 1).unwrap_or(0) != 44 {
-        start = start - 1;
-      }
-      while start < end && (raw_header.get(start).unwrap_or(0) == 32 || raw_header.get(start).unwrap_or(0) == 9) {
-        start = start + 1;
-      }
-      if start >= end {
-        return remote_addr.clone();
-      }
-      let ip_bytes = raw_header.slice(start, end).unwrap_or(Bytes.new());
-      return match ip_bytes.to_string_utf8() {
-        Ok(s) => s,
-        Err(_) => remote_addr.clone(),
-      };
-    }
+  let raw_header = req.header(&"x-forwarded-for")?;
+  let len = raw_header.byte_len();
+  let mut end = len;
+  while end > 0 && (raw_header.get(end - 1).unwrap_or(0) == 32 || raw_header.get(end - 1).unwrap_or(0) == 9) {
+    end = end - 1;
   }
+  let mut start = end;
+  while start > 0 && raw_header.get(start - 1).unwrap_or(0) != 44 {
+    start = start - 1;
+  }
+  while start < end && (raw_header.get(start).unwrap_or(0) == 32 || raw_header.get(start).unwrap_or(0) == 9) {
+    start = start + 1;
+  }
+  if start >= end {
+    return None;
+  }
+  let ip_bytes = raw_header.slice(start, end).unwrap_or(Bytes.new());
+  return match ip_bytes.to_string_utf8() {
+    Ok(s) => Some(s),
+    Err(_) => None,
+  };
+}
+
+fn is_json_content_type(ct: &Bytes) -> Bool
+  intent "メディアタイプが application/json そのもの（大文字小文字は区別しない）で、後ろが終端または ; のときだけ真にする"
+  requires none
+  ensures none
+  effects none
+{
+  let app_json = "application/json".as_bytes();
+  if !bytes_starts_with_case_insensitive(&ct, &app_json) {
+    return false;
+  }
+  let len = ct.byte_len();
+  let mut i = app_json.byte_len();
+  while i < len && (ct.get(i).unwrap_or(0) == 32 || ct.get(i).unwrap_or(0) == 9) {
+    i = i + 1;
+  }
+  return i == len || ct.get(i).unwrap_or(0) == 59;
 }
 
 pub fn check_csrf(req: &HttpRequest, public_origin: &String) -> Result<Bool, HttpResponse>
@@ -423,8 +432,7 @@ pub fn check_csrf(req: &HttpRequest, public_origin: &String) -> Result<Bool, Htt
       return Err(fixed_bad_request());
     }
     Some(ct) => {
-      let app_json = "application/json".as_bytes();
-      if !bytes_starts_with_case_insensitive(&ct, &app_json) {
+      if !is_json_content_type(&ct) {
         return Err(fixed_bad_request());
       }
     }
@@ -683,7 +691,16 @@ fn handle_login(service: &mut HttpService, users: &mut UserStore, gate: &mut Log
     }
   }
 
-  let client_ip = extract_client_ip(&req, &remote_addr, &service.config.trusted_proxies);
+  // 信頼プロキシ経由なのに X-Forwarded-For が使えないなら、全利用者が 1 つの IP 抑制を共有しないよう 400 で拒否する。
+  let mut client_ip = "";
+  match extract_client_ip(&req, &remote_addr, &service.config.trusted_proxies) {
+    Some(ip) => {
+      client_ip = ip;
+    }
+    None => {
+      return fixed_bad_request();
+    }
+  }
   let ip_key = throttle_key(&client_ip.as_bytes());
   let ip_wait = lock_remaining(&mut service.ip_throttle, &ip_key, now);
   if ip_wait > 0 {
@@ -901,14 +918,14 @@ fn handle_token(service: &HttpService, kv: &mut PersistentStore, users: &mut Use
     return fixed_bad_request();
   }
 
-  let mut aud_key_bytes = Bytes.new();
+  let mut aud_index = 0;
   let mut found_aud = false;
   let mut i = 0;
   while i < service.config.audiences.len() && !found_aud {
     match service.config.audiences.get(i) {
       Some(aud_cfg) => {
         if aud_cfg.name == aud_str {
-          aud_key_bytes = aud_cfg.key.expose();
+          aud_index = i;
           found_aud = true;
         }
       }
@@ -919,7 +936,6 @@ fn handle_token(service: &HttpService, kv: &mut PersistentStore, users: &mut Use
   if !found_aud {
     return fixed_forbidden();
   }
-  let aud_key = Secret.from_bytes(aud_key_bytes);
 
   let mut now = 0;
   match sample_time() {
@@ -931,19 +947,29 @@ fn handle_token(service: &HttpService, kv: &mut PersistentStore, users: &mut Use
     }
   }
 
-  match issue_access_token(&aud_key, &aud_str, &user_id, now, service.config.token_lifetime) {
+  // 署名鍵は Secret のまま渡す（expose で Bytes に出して作り直さない）。
+  let mut token_bytes = Bytes.new();
+  match service.config.audiences.get(aud_index) {
+    Some(aud_cfg) => {
+      match issue_access_token(&aud_cfg.key, &aud_str, &user_id, now, service.config.token_lifetime) {
+        Some(t) => {
+          token_bytes = t;
+        }
+        None => {
+          return fixed_internal_error();
+        }
+      }
+    }
     None => {
       return fixed_internal_error();
     }
-    Some(token_bytes) => {
-      let mut body = "{\"token\":\"".as_bytes();
-      body.extend(&token_bytes);
-      body.extend(&"\",\"expires_in\":".as_bytes());
-      body.extend(&decimal(service.config.token_lifetime).as_bytes());
-      body.extend(&"}".as_bytes());
-      return HttpResponse.new(200, body).with_header(&"content-type", &"application/json".as_bytes()).with_header(&"cache-control", &"no-store".as_bytes());
-    }
   }
+  let mut body = "{\"token\":\"".as_bytes();
+  body.extend(&token_bytes);
+  body.extend(&"\",\"expires_in\":".as_bytes());
+  body.extend(&decimal(service.config.token_lifetime).as_bytes());
+  body.extend(&"}".as_bytes());
+  return HttpResponse.new(200, body).with_header(&"content-type", &"application/json".as_bytes()).with_header(&"cache-control", &"no-store".as_bytes());
 }
 
 pub fn handle_auth_request(service: &mut HttpService, users: &mut UserStore, gate: &mut LoginGate, kv: &mut PersistentStore, pending: &mut PendingLogouts, req: &HttpRequest, remote_addr: &String, sample_time: fn() -> Option<Int>) -> HttpResponse
