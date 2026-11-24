@@ -1,0 +1,332 @@
+module stage_three_tcp_support
+  targets server
+  trust none
+
+use db.iohook.act_fail_io;
+use db.iohook.io_fault;
+use stash.persistent.PersistentStore;
+use stash.persistent.StoreError;
+use stash.persistent.close_persistent;
+use stash.persistent.delete;
+use stash.persistent.get;
+use stash.persistent.is_stopped;
+use stash.persistent.open_persistent;
+use stash.persistent.put;
+use stash.protocol.Request;
+use stash.protocol.Response;
+use stash.protocol.kv_error_code;
+use stash.protocol.read_request;
+use stash.protocol.write_response;
+
+pub struct ServerState {
+  store: Option<PersistentStore>,
+  current_time: Int,
+  done: Bool,
+}
+
+pub fn new_server_state(store: PersistentStore, initial_time: Int) -> ServerState
+  intent "Create initial ServerState"
+  requires none
+  ensures none
+  effects none
+{
+  return ServerState { store: Some(store), current_time: initial_time, done: false };
+}
+
+fn store_error_code(err: StoreError) -> Int
+  intent "Map StoreError to error code"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    StoreError.Kv(k) => kv_error_code(k),
+    StoreError.Stopped => 101,
+    StoreError.CommitUnknown => 102,
+    StoreError.Db(_) => 103,
+  };
+}
+
+fn handle_req(store: &mut PersistentStore, req: Request, now: Int) -> Response
+  intent "Handle request"
+  requires none
+  ensures none
+  effects fs
+{
+  match req {
+    Request.Ping => {
+      return Response.Success;
+    }
+    Request.Get(key) => {
+      let res = get(&mut store, &key, move || Some(now));
+      return match res {
+        Ok(opt) => match opt {
+          Some(val) => Response.Value(val),
+          None => Response.NotFound,
+        },
+        Err(err) => Response.Error(store_error_code(err), Bytes.new()),
+      };
+    }
+    Request.Put(key, val, ttl) => {
+      let res = put(&mut store, &key, &val, ttl, move || Some(now));
+      return match res {
+        Ok(_) => Response.Success,
+        Err(err) => Response.Error(store_error_code(err), Bytes.new()),
+      };
+    }
+    Request.Delete(key) => {
+      let res = delete(&mut store, &key);
+      return match res {
+        Ok(_) => Response.Success,
+        Err(err) => Response.Error(store_error_code(err), Bytes.new()),
+      };
+    }
+  }
+}
+
+fn process_req(srv: &SyncShared<Lock<ServerState>>, req: Request) -> Response
+  intent "Process request with lock"
+  requires none
+  ensures none
+  effects fs, task.share, task.suspend
+{
+  match srv.borrow().acquire() {
+    Ok(g0) => {
+      let mut g = g0;
+      let st = g.get_mut();
+      let now = st.current_time;
+      let mut opt = st.store.take();
+      let mut resp = Response.Error(101, Bytes.new());
+      match opt {
+        Some(s) => {
+          let mut val = s;
+          resp = handle_req(&mut val, req, now);
+          st.store = Some(val);
+        }
+        None => {}
+      }
+      return resp;
+    }
+    Err(_) => {
+      return Response.Error(101, Bytes.new());
+    }
+  }
+}
+
+pub fn dispatch_one(stream: &TcpStream, srv: &SyncShared<Lock<ServerState>>) -> Bool
+  intent "Dispatch one"
+  requires none
+  ensures none
+  effects fs, net.server, task.share, task.suspend
+{
+  let maybe_req = read_request(&stream);
+  let mut req = Request.Ping;
+  match maybe_req {
+    Ok(r) => {
+      req = r;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  let resp = process_req(&srv, req);
+  let write_res = write_response(&stream, &resp);
+  return write_res.is_ok();
+}
+
+pub fn serve_stream_loop(stream: &TcpStream, srv: &SyncShared<Lock<ServerState>>)
+  intent "Serve stream loop"
+  requires none
+  ensures none
+  effects fs, net.server, task.share, task.suspend
+{
+  let mut keep_going = true;
+  while keep_going {
+    if !dispatch_one(&stream, &srv) {
+      keep_going = false;
+    }
+  }
+}
+
+pub fn is_server_done(srv: &SyncShared<Lock<ServerState>>) -> Bool
+  intent "Check done"
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  return match srv.borrow().acquire() {
+    Ok(g) => g.get().done,
+    Err(_) => true,
+  };
+}
+
+pub fn set_server_done(srv: &SyncShared<Lock<ServerState>>, done: Bool)
+  intent "Set done"
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  match srv.borrow().acquire() {
+    Ok(g0) => {
+      let mut g = g0;
+      let st = g.get_mut();
+      st.done = done;
+    }
+    Err(_) => {}
+  }
+}
+
+pub fn set_server_time(srv: &SyncShared<Lock<ServerState>>, time: Int)
+  intent "Set server virtual time"
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  match srv.borrow().acquire() {
+    Ok(g0) => {
+      let mut g = g0;
+      let st = g.get_mut();
+      st.current_time = time;
+    }
+    Err(_) => {}
+  }
+}
+
+pub fn inject_io_fault(srv: &SyncShared<Lock<ServerState>>, step: Int, count: Int)
+  intent "Inject WAL io fault"
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  match srv.borrow().acquire() {
+    Ok(g0) => {
+      let mut g = g0;
+      let st = g.get_mut();
+      let mut opt = st.store.take();
+      match opt {
+        Some(s) => {
+          let mut val = s;
+          val.database.io.step = step;
+          val.database.io.faults.push(io_fault(1, act_fail_io(), count));
+          st.store = Some(val);
+        }
+        None => {}
+      }
+    }
+    Err(_) => {}
+  }
+}
+
+pub fn is_server_store_stopped(srv: &SyncShared<Lock<ServerState>>) -> Bool
+  intent "Check if store is stopped"
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  match srv.borrow().acquire() {
+    Ok(g0) => {
+      let mut g = g0;
+      let st = g.get_mut();
+      let mut opt = st.store.take();
+      let mut stopped = false;
+      match opt {
+        Some(s) => {
+          stopped = is_stopped(&s);
+          st.store = Some(s);
+        }
+        None => {}
+      }
+      return stopped;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+}
+
+pub fn recover_persistent_store(srv: &SyncShared<Lock<ServerState>>, dir: String, db_id: Bytes) -> Bool
+  intent "Recover persistent store"
+  requires none
+  ensures none
+  effects fs, task.share, task.suspend
+{
+  match srv.borrow().acquire() {
+    Ok(g0) => {
+      let mut g = g0;
+      let st = g.get_mut();
+      let mut opt = st.store.take();
+      match opt {
+        Some(s) => {
+          let _ = close_persistent(s);
+        }
+        None => {}
+      }
+      match open_persistent(dir, db_id, true) {
+        Ok(new_s) => {
+          st.store = Some(new_s);
+          return true;
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+}
+
+pub fn close_server_store(srv: &SyncShared<Lock<ServerState>>) -> Bool
+  intent "Close persistent store on server"
+  requires none
+  ensures none
+  effects fs, task.share, task.suspend
+{
+  match srv.borrow().acquire() {
+    Ok(g0) => {
+      let mut g = g0;
+      let st = g.get_mut();
+      let mut opt = st.store.take();
+      match opt {
+        Some(s) => {
+          let _ = close_persistent(s);
+          return true;
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+}
+
+pub fn run_server(listener: &TcpListener, srv: &SyncShared<Lock<ServerState>>)
+  intent "Run server"
+  requires none
+  ensures none
+  effects fs, net.server, task.share, task.suspend
+{
+  let mut running = true;
+  while running {
+    if is_server_done(&srv) {
+      running = false;
+    } else {
+      match listener.accept() {
+        Ok(stream) => {
+          if is_server_done(&srv) {
+            running = false;
+          } else {
+            serve_stream_loop(&stream, &srv);
+          }
+        }
+        Err(_) => {
+          running = false;
+        }
+      }
+    }
+  }
+}
